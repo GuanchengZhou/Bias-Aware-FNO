@@ -280,7 +280,12 @@ def main() -> None:
     last_test_fine = float("nan")
     epoch_iterator = range(args.epochs)
     if tqdm is not None:
-        epoch_iterator = tqdm(epoch_iterator, desc="Darcy FNO", dynamic_ncols=True)
+        epoch_iterator = tqdm(
+            epoch_iterator,
+            desc="Darcy FNO Epochs",
+            dynamic_ncols=True,
+            position=0,
+        )
 
     for ep in epoch_iterator:
         model.train()
@@ -288,7 +293,18 @@ def main() -> None:
         train_l2_coarse = 0.0
         train_count = 0
 
-        for xx, yy_coarse in train_loader:
+        train_iterator = train_loader
+        if tqdm is not None:
+            train_iterator = tqdm(
+                train_loader,
+                desc=f"Train {ep + 1:04d}/{args.epochs:04d}",
+                total=len(train_loader),
+                dynamic_ncols=True,
+                position=1,
+                leave=False,
+            )
+
+        for xx, yy_coarse in train_iterator:
             xx = xx.to(device)
             yy_coarse = yy_coarse.to(device)
 
@@ -300,6 +316,12 @@ def main() -> None:
 
             train_l2_coarse += loss.item()
             train_count += yy_coarse.shape[0]
+
+            if tqdm is not None:
+                train_iterator.set_postfix(
+                    batch_l2=f"{loss.item() / yy_coarse.shape[0]:.3e}",
+                    avg_l2=f"{train_l2_coarse / train_count:.3e}",
+                )
 
         scheduler.step()
         t2 = default_timer()
@@ -315,8 +337,18 @@ def main() -> None:
             test_l2_coarse_reference = 0.0
             test_l2_fine = 0.0
             test_count = 0
+            test_iterator = test_loader
+            if tqdm is not None:
+                test_iterator = tqdm(
+                    test_loader,
+                    desc=f"Test  {ep + 1:04d}/{args.epochs:04d}",
+                    total=len(test_loader),
+                    dynamic_ncols=True,
+                    position=1,
+                    leave=False,
+                )
             with torch.no_grad():
-                for xx, coeff_batch, yy_coarse, yy_fine in test_loader:
+                for xx, coeff_batch, yy_coarse, yy_fine in test_iterator:
                     xx = xx.to(device)
                     yy_coarse = yy_coarse.to(device)
                     yy_fine = yy_fine.to(device)
@@ -337,6 +369,12 @@ def main() -> None:
                         yy_coarse[0].cpu(),
                         yy_fine[0].cpu(),
                     )
+
+                    if tqdm is not None:
+                        test_iterator.set_postfix(
+                            coarse_l2=f"{test_l2_coarse_reference / test_count:.3e}",
+                            fine_l2=f"{test_l2_fine / test_count:.3e}",
+                        )
 
             last_test_coarse_reference = test_l2_coarse_reference / test_count
             last_test_fine = test_l2_fine / test_count
