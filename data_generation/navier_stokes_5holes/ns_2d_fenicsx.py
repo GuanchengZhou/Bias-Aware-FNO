@@ -74,7 +74,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mesh-size-min", type=float, default=0.05)
     parser.add_argument("--mesh-size-max", type=float, default=0.08)
-    parser.add_argument("--gamma-drive", type=float, default=0.1)
+    parser.add_argument("--gamma-drive", type=float, default=0.25)
+    parser.add_argument("--forcing-scale", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-holes", type=int, default=5)
     parser.add_argument("--radius-min", type=float, default=0.05)
@@ -83,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hole-gap-min", type=float, default=0.03)
     parser.add_argument("--max-placement-attempts", type=int, default=2000)
     parser.add_argument("--stream-modes", type=int, default=4)
-    parser.add_argument("--stream-scale", type=float, default=0.2)
+    parser.add_argument("--stream-scale", type=float, default=1.0)
     parser.add_argument("--save-aux-fields", action="store_true")
     parser.add_argument("--ood-radius-min", type=float, default=None)
     parser.add_argument("--ood-radius-max", type=float, default=None)
@@ -271,6 +272,19 @@ def build_mask(theta: np.ndarray, grid_xy: np.ndarray) -> np.ndarray:
     return mask
 
 
+def build_forcing_scalar_grid(resolution: int, forcing_scale: float) -> np.ndarray:
+    coords = np.linspace(0.0, 1.0, resolution, dtype=np.float64)
+    grid_x, grid_y = np.meshgrid(coords, coords, indexing="ij")
+    phase = 2.0 * np.pi * (grid_x + grid_y)
+    return forcing_scale * (np.sin(phase) + np.cos(phase))
+
+
+def build_body_force_ufl(x_coord, forcing_scale: float):
+    phase = 2.0 * np.pi * (x_coord[0] + x_coord[1])
+    force_x = forcing_scale * (ufl.sin(phase) + ufl.cos(phase))
+    return ufl.as_vector((force_x, ufl.as_ufl(0.0)))
+
+
 def locate_valid_points(msh, points: np.ndarray, mask: np.ndarray):
     flat_mask = mask.reshape(-1)
     fluid_indices = np.flatnonzero(~flat_mask)
@@ -319,7 +333,7 @@ def compute_vorticity_from_velocity(velocity_grid: np.ndarray, coords: np.ndarra
     return vort
 
 
-def build_problem(msh, facet_tags, dt: float, nu: float, gamma_drive: float):
+def build_problem(msh, facet_tags, dt: float, nu: float, gamma_drive: float, forcing_scale: float):
     P2 = element("Lagrange", msh.basix_cell(), degree=2, shape=(msh.geometry.dim,), dtype=default_real_type)
     P1 = element("Lagrange", msh.basix_cell(), degree=1, dtype=default_real_type)
     W = functionspace(msh, mixed_element([P2, P1]))
@@ -354,6 +368,7 @@ def build_problem(msh, facet_tags, dt: float, nu: float, gamma_drive: float):
     n = ufl.FacetNormal(msh)
     ds = ufl.Measure("ds", domain=msh, subdomain_data=facet_tags)
     p0 = gamma_drive * (1.0 - x_coord[0])
+    body_force = build_body_force_ufl(x_coord, forcing_scale)
 
     a = (
         (1.0 / dt) * ufl.inner(u, v) * ufl.dx
@@ -362,7 +377,11 @@ def build_problem(msh, facet_tags, dt: float, nu: float, gamma_drive: float):
         - p * ufl.div(v) * ufl.dx
         + q * ufl.div(u) * ufl.dx
     )
-    L = (1.0 / dt) * ufl.inner(u_prev, v) * ufl.dx + ufl.inner(p0 * n, v) * (ds(TAG_LEFT) + ds(TAG_RIGHT))
+    L = (
+        (1.0 / dt) * ufl.inner(u_prev, v) * ufl.dx
+        + ufl.inner(body_force, v) * ufl.dx
+        + ufl.inner(p0 * n, v) * (ds(TAG_LEFT) + ds(TAG_RIGHT))
+    )
 
     problem = LinearProblem(
         a,
@@ -392,7 +411,14 @@ def build_problem(msh, facet_tags, dt: float, nu: float, gamma_drive: float):
 
 def solve_one_sample(theta: np.ndarray, args: argparse.Namespace, rng: np.random.Generator):
     msh, facet_tags = build_mesh(theta, float(args.mesh_size_min), float(args.mesh_size_max))
-    state = build_problem(msh, facet_tags, float(args.dt), float(args.nu), float(args.gamma_drive))
+    state = build_problem(
+        msh,
+        facet_tags,
+        float(args.dt),
+        float(args.nu),
+        float(args.gamma_drive),
+        float(args.forcing_scale),
+    )
 
     coeffs = sample_stream_coefficients(rng, int(args.stream_modes), float(args.stream_scale))
     state["u_prev"].interpolate(build_initial_velocity_callable(coeffs))
@@ -400,6 +426,7 @@ def solve_one_sample(theta: np.ndarray, args: argparse.Namespace, rng: np.random
 
     coords, points, grid_xy = build_regular_grid(int(args.grid_resolution))
     mask = build_mask(theta, grid_xy)
+    forcing_grid = build_forcing_scalar_grid(int(args.grid_resolution), float(args.forcing_scale))
     selected_indices, selected_points, selected_cells = locate_valid_points(msh, points, mask)
 
     initial_velocity_grid = evaluate_function_on_grid(
@@ -461,6 +488,7 @@ def solve_one_sample(theta: np.ndarray, args: argparse.Namespace, rng: np.random
         "mask": mask.astype(np.float32),
         "theta": theta.astype(np.float32),
         "t": times.astype(np.float32),
+        "f": forcing_grid.astype(np.float32),
         "velocity_u": velocity_u,
         "velocity_v": velocity_v,
         "pressure": pressure,
@@ -474,11 +502,13 @@ def save_split(out_path: Path, split: str, payload: dict[str, np.ndarray], args:
         "mask": payload["mask"].astype(np.float32),
         "theta": payload["theta"].astype(np.float32),
         "t": payload["t"].astype(np.float32),
+        "f": payload["f"].astype(np.float32),
         "nu": np.asarray([args.nu], dtype=np.float32),
         "eta": np.asarray([args.eta], dtype=np.float32),
         "final_time": np.asarray([args.final_time], dtype=np.float32),
         "dt": np.asarray([args.dt], dtype=np.float32),
         "gamma_drive": np.asarray([args.gamma_drive], dtype=np.float32),
+        "forcing_scale": np.asarray([args.forcing_scale], dtype=np.float32),
         "split": np.asarray([split], dtype=object),
     }
     if args.save_aux_fields:
@@ -578,6 +608,7 @@ def generate_split(
             "mask": mask_all,
             "theta": theta_all,
             "t": t_all,
+            "f": sample_payload["f"],
             "velocity_u": velocity_u_all,
             "velocity_v": velocity_v_all,
             "pressure": pressure_all,
