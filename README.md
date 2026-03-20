@@ -28,6 +28,8 @@ cd /Users/zhougc/Desktop/IID/LRTOR_project/Bias_Aware_FNO
 /Users/zhougc/miniconda3/envs/fenicsx-env/bin/python data_generation/navier_stokes_5holes/ns_2d_fenicsx.py
 ```
 
+Large datasets automatically fall back to an HDF5-backed `.mat` file when classic MAT v5 would exceed the 4 GB array limit. The existing training scripts and visualization notebook can read both formats.
+
 Smoke test:
 ```bash
 /Users/zhougc/miniconda3/envs/fenicsx-env/bin/python data_generation/navier_stokes_5holes/ns_2d_fenicsx.py \

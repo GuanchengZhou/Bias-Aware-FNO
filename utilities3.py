@@ -21,15 +21,21 @@ class MatReader(object):
         self.file_path = file_path
         self.data = None
         self.old_mat = None
+        self.hdf5_layout = None
         self._load_file()
 
     def _load_file(self):
         try:
             self.data = scipy.io.loadmat(self.file_path)
             self.old_mat = True
+            self.hdf5_layout = None
         except Exception:
             self.data = h5py.File(self.file_path, mode="r")
             self.old_mat = False
+            layout = self.data.attrs.get("bias_aware_layout", "")
+            if isinstance(layout, bytes):
+                layout = layout.decode("utf-8")
+            self.hdf5_layout = str(layout)
 
     def load_file(self, file_path):
         self.file_path = file_path
@@ -40,7 +46,8 @@ class MatReader(object):
 
         if not self.old_mat:
             x = x[()]
-            x = np.transpose(x, axes=range(len(x.shape) - 1, -1, -1))
+            if self.hdf5_layout != "numpy":
+                x = np.transpose(x, axes=range(len(x.shape) - 1, -1, -1))
 
         if self.to_float:
             x = x.astype(np.float32)

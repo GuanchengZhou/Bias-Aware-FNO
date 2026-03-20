@@ -8,6 +8,7 @@ import math
 import sys
 from pathlib import Path
 
+import h5py
 import numpy as np
 import scipy.io
 
@@ -40,6 +41,7 @@ TAG_NOSLIP = 1
 TAG_LEFT = 2
 TAG_RIGHT = 3
 TAG_DOMAIN = 10
+MAT_V5_BYTE_LIMIT = np.iinfo(np.uint32).max
 
 
 def format_float_token(value: float) -> str:
@@ -86,6 +88,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ood-radius-min", type=float, default=None)
     parser.add_argument("--ood-radius-max", type=float, default=None)
     parser.add_argument("--ood-hole-gap-min", type=float, default=None)
+    parser.add_argument(
+        "--file-format",
+        choices=["auto", "mat", "hdf5"],
+        default="auto",
+        help="Dataset storage format. 'auto' writes MAT v5 when possible and falls back to HDF5-backed .mat for large arrays.",
+    )
     return parser.parse_args()
 
 
@@ -477,7 +485,40 @@ def save_split(out_path: Path, split: str, payload: dict[str, np.ndarray], args:
         mdict["velocity_u"] = payload["velocity_u"].astype(np.float32)
         mdict["velocity_v"] = payload["velocity_v"].astype(np.float32)
         mdict["pressure"] = payload["pressure"].astype(np.float32)
-    scipy.io.savemat(out_path, mdict)
+    file_format = resolve_storage_format(mdict, args.file_format)
+    if file_format == "mat":
+        scipy.io.savemat(out_path, mdict)
+    else:
+        save_hdf5_mat(out_path, mdict, split)
+    print(f"Saved {split} dataset using {file_format} format -> {out_path}")
+
+
+def resolve_storage_format(mdict: dict[str, np.ndarray], requested: str) -> str:
+    if requested in {"mat", "hdf5"}:
+        return requested
+
+    max_array_bytes = 0
+    total_bytes = 0
+    for value in mdict.values():
+        if isinstance(value, np.ndarray):
+            max_array_bytes = max(max_array_bytes, int(value.nbytes))
+            total_bytes += int(value.nbytes)
+
+    if max_array_bytes >= MAT_V5_BYTE_LIMIT or total_bytes >= MAT_V5_BYTE_LIMIT:
+        return "hdf5"
+    return "mat"
+
+
+def save_hdf5_mat(out_path: Path, mdict: dict[str, np.ndarray], split: str) -> None:
+    with h5py.File(out_path, "w") as handle:
+        handle.attrs["bias_aware_layout"] = "numpy"
+        handle.attrs["split"] = split
+        for key, value in mdict.items():
+            if isinstance(value, np.ndarray) and value.dtype == object:
+                encoded = np.asarray([str(item) for item in value.reshape(-1)], dtype="S")
+                handle.create_dataset(key, data=encoded)
+            else:
+                handle.create_dataset(key, data=value)
 
 
 def generate_split(
@@ -559,8 +600,7 @@ def main() -> None:
     for split, n_samples, radius_range, hole_gap_min in build_split_spec(args):
         if n_samples <= 0:
             continue
-        out_path = generate_split(split, n_samples, radius_range, hole_gap_min, args, rng)
-        print(f"Saved {split} dataset -> {out_path}")
+        generate_split(split, n_samples, radius_range, hole_gap_min, args, rng)
 
 
 if __name__ == "__main__":
