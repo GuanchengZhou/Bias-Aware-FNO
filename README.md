@@ -1,35 +1,49 @@
 # Bias_Aware_FNO
 
-FNO-style scripts for random five-hole Brinkman-penalized Navier-Stokes data generation, training, and evaluation.
+FNO-style training and evaluation scripts for random five-hole Navier-Stokes data.
 
-Use the PyTorch environment on this machine:
+Data generation now uses `gmsh + dolfinx + PETSc` in `fenicsx-env`.
+Training and evaluation still use the original FNO-style PyTorch scripts in `torch_310`.
+
+PyTorch environment:
 ```bash
 /Users/zhougc/miniconda3/envs/torch_310/bin/python
 ```
 
+FEniCSx environment:
+```bash
+/Users/zhougc/miniconda3/envs/fenicsx-env/bin/python
+```
+
 ## Layout
 - `Adam.py`, `utilities3.py`: utilities kept in the original `fourier-neural-operator` style.
-- `data_generation/navier_stokes_5holes/ns_2d_brinkman.py`: dataset generator.
+- `data_generation/navier_stokes_5holes/ns_2d_fenicsx.py`: default FEniCSx dataset generator.
+- `data_generation/navier_stokes_5holes/ns_2d_brinkman.py`: legacy spectral baseline.
 - `fourier_2d_time_5holes.py`: recurrent one-step FNO training script.
 - `scripts/eval_2d_time_5holes.py`: rollout evaluation script.
 
 ## Data Generation
 ```bash
 cd /Users/zhougc/Desktop/IID/LRTOR_project/Bias_Aware_FNO
-/Users/zhougc/miniconda3/envs/torch_310/bin/python data_generation/navier_stokes_5holes/ns_2d_brinkman.py
+/Users/zhougc/miniconda3/envs/fenicsx-env/bin/python data_generation/navier_stokes_5holes/ns_2d_fenicsx.py
 ```
 
 Smoke test:
 ```bash
-/Users/zhougc/miniconda3/envs/torch_310/bin/python data_generation/navier_stokes_5holes/ns_2d_brinkman.py \
-  --resolution 64 \
-  --n-train 8 \
-  --n-test 4 \
+/Users/zhougc/miniconda3/envs/fenicsx-env/bin/python data_generation/navier_stokes_5holes/ns_2d_fenicsx.py \
+  --grid-resolution 64 \
+  --n-train 2 \
+  --n-test 1 \
   --record-steps 10 \
   --final-time 1.0 \
-  --delta-t 1e-3 \
-  --batch-size 4 \
-  --device cpu
+  --dt 0.1 \
+  --mesh-size-min 0.10 \
+  --mesh-size-max 0.14
+```
+
+Legacy spectral baseline:
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python data_generation/navier_stokes_5holes/ns_2d_brinkman.py
 ```
 
 ## Training
