@@ -11,6 +11,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 import scipy.io
+from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import gaussian_filter
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
@@ -74,6 +76,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mesh-size-min", type=float, default=0.05)
     parser.add_argument("--mesh-size-max", type=float, default=0.08)
+    parser.add_argument(
+        "--mesh-density",
+        type=float,
+        default=None,
+        help="Target elements per unit length. Overrides mesh-size-min/max when set; larger is finer.",
+    )
     parser.add_argument("--gamma-drive", type=float, default=0.0)
     parser.add_argument("--forcing-scale", type=float, default=1.25)
     parser.add_argument("--seed", type=int, default=0)
@@ -82,9 +90,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--radius-max", type=float, default=0.08)
     parser.add_argument("--boundary-margin", type=float, default=0.05)
     parser.add_argument("--hole-gap-min", type=float, default=0.03)
+    parser.add_argument("--smooth-sigma", type=float, default=1.5, help="Gaussian smoothing sigma in pixels for chi_smooth export.")
     parser.add_argument("--max-placement-attempts", type=int, default=2000)
-    parser.add_argument("--stream-modes", type=int, default=4)
-    parser.add_argument("--stream-scale", type=float, default=12.0)
+    parser.add_argument("--stream-modes", type=int, default=4, help="Legacy option kept for CLI compatibility; unused in the Brinkman-aligned initial condition path.")
+    parser.add_argument(
+        "--initial-vorticity-scale",
+        "--stream-scale",
+        dest="initial_vorticity_scale",
+        type=float,
+        default=1.0,
+        help="Amplitude multiplier for the Brinkman-aligned Gaussian random field initial vorticity. --stream-scale is kept as a legacy alias.",
+    )
+    parser.add_argument("--grf-alpha", type=float, default=2.5)
+    parser.add_argument("--grf-tau", type=float, default=7.0)
     parser.add_argument("--save-aux-fields", action="store_true")
     parser.add_argument("--ood-radius-min", type=float, default=None)
     parser.add_argument("--ood-radius-max", type=float, default=None)
@@ -96,6 +114,15 @@ def parse_args() -> argparse.Namespace:
         help="Dataset storage format. 'auto' writes MAT v5 when possible and falls back to HDF5-backed .mat for large arrays.",
     )
     return parser.parse_args()
+
+
+def resolve_mesh_sizes(args: argparse.Namespace) -> tuple[float, float]:
+    if args.mesh_density is not None:
+        if float(args.mesh_density) <= 0.0:
+            raise ValueError("mesh_density must be positive.")
+        mesh_size = 1.0 / float(args.mesh_density)
+        return mesh_size, mesh_size
+    return float(args.mesh_size_min), float(args.mesh_size_max)
 
 
 def build_split_spec(args: argparse.Namespace) -> list[tuple[str, int, tuple[float, float], float]]:
@@ -204,6 +231,10 @@ def build_mesh(theta: np.ndarray, mesh_size_min: float, mesh_size_max: float):
     return mesh_data, None
 
 
+def periodic_grid_coords(resolution: int) -> np.ndarray:
+    return np.linspace(0.0, 1.0, resolution + 1, dtype=np.float64)[:-1]
+
+
 def g(x):
     return x**2 * (1.0 - x) ** 2
 
@@ -212,51 +243,70 @@ def gp(x):
     return 2.0 * x * (1.0 - x) * (1.0 - 2.0 * x)
 
 
-def sample_stream_coefficients(rng: np.random.Generator, n_modes: int, scale: float) -> np.ndarray:
-    kx = np.arange(1, n_modes + 1, dtype=np.float64)[:, None]
-    ky = np.arange(1, n_modes + 1, dtype=np.float64)[None, :]
-    decay = (kx**2 + ky**2) ** 1.5
-    coeffs = rng.normal(scale=scale, size=(n_modes, n_modes)) / decay
-    return coeffs.astype(np.float64)
+def sample_initial_vorticity_grf(
+    rng: np.random.Generator,
+    resolution: int,
+    alpha: float,
+    tau: float,
+    scale: float,
+) -> np.ndarray:
+    sigma = tau ** (0.5 * (2.0 * alpha - 2.0))
+    freq = np.fft.fftfreq(resolution, d=1.0 / resolution)
+    kx, ky = np.meshgrid(freq, freq, indexing="ij")
+    k2 = kx**2 + ky**2
+    sqrt_eig = (resolution**2) * math.sqrt(2.0) * sigma * ((4.0 * (math.pi**2) * k2 + tau**2) ** (-alpha / 2.0))
+    sqrt_eig[0, 0] = 0.0
+
+    coeff = (rng.standard_normal((resolution, resolution)) + 1j * rng.standard_normal((resolution, resolution))) * sqrt_eig
+    sample = np.fft.ifftn(coeff).real
+    return (scale * sample).astype(np.float64)
 
 
-def build_initial_velocity_callable(coeffs: np.ndarray):
-    n_modes = coeffs.shape[0]
-    kx = np.arange(1, n_modes + 1, dtype=np.float64)[:, None, None]
-    ky = np.arange(1, n_modes + 1, dtype=np.float64)[None, :, None]
-    coeffs = coeffs[:, :, None]
+def velocity_from_vorticity_grid(vorticity_grid: np.ndarray) -> np.ndarray:
+    resolution = int(vorticity_grid.shape[0])
+    freq = np.fft.fftfreq(resolution, d=1.0 / resolution)
+    freq_phys = 2.0 * math.pi * freq
+    kx, ky = np.meshgrid(freq_phys, freq_phys, indexing="ij")
+    lap = kx**2 + ky**2
+    inv_lap = np.zeros_like(lap)
+    nonzero = lap != 0.0
+    inv_lap[nonzero] = 1.0 / lap[nonzero]
+
+    w_hat = np.fft.fftn(vorticity_grid)
+    psi_hat = w_hat * inv_lap
+    ux = np.fft.ifftn(1j * ky * psi_hat).real
+    uy = np.fft.ifftn(-1j * kx * psi_hat).real
+    return np.stack([ux, uy], axis=-1).astype(np.float64)
+
+
+def build_initial_velocity_callable(velocity_grid: np.ndarray):
+    resolution = int(velocity_grid.shape[0])
+    coords = periodic_grid_coords(resolution)
+    coords_ext = np.concatenate([coords, [1.0]])
+    velocity_ext = np.empty((resolution + 1, resolution + 1, 2), dtype=np.float64)
+    velocity_ext[:-1, :-1] = velocity_grid
+    velocity_ext[-1, :-1] = velocity_grid[0, :, :]
+    velocity_ext[:-1, -1] = velocity_grid[:, 0, :]
+    velocity_ext[-1, -1] = velocity_grid[0, 0, :]
+
+    interp_ux = RegularGridInterpolator((coords_ext, coords_ext), velocity_ext[..., 0], bounds_error=False, fill_value=None)
+    interp_uy = RegularGridInterpolator((coords_ext, coords_ext), velocity_ext[..., 1], bounds_error=False, fill_value=None)
 
     def velocity(x):
-        xs = x[0][None, None, :]
-        ys = x[1][None, None, :]
-        sinx = np.sin(np.pi * kx * xs)
-        cosx = np.cos(np.pi * kx * xs)
-        siny = np.sin(np.pi * ky * ys)
-        cosy = np.cos(np.pi * ky * ys)
-
-        stream_sum = np.sum(coeffs * sinx * siny, axis=(0, 1))
-        stream_dx = np.sum(coeffs * (np.pi * kx) * cosx * siny, axis=(0, 1))
-        stream_dy = np.sum(coeffs * (np.pi * ky) * sinx * cosy, axis=(0, 1))
-
-        gx = g(x[0])
-        gy = g(x[1])
-        gpx = gp(x[0])
-        gpy = gp(x[1])
-
-        u_x = gx * (gpy * stream_sum + gy * stream_dy)
-        u_y = -(gpx * gy * stream_sum + gx * gy * stream_dx)
+        points = np.column_stack([np.mod(x[0], 1.0), np.mod(x[1], 1.0)])
+        u_x = interp_ux(points)
+        u_y = interp_uy(points)
         return np.vstack([u_x, u_y]).astype(default_real_type)
 
     return velocity
 
 
 def build_regular_grid(resolution: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    coords = np.linspace(0.0, 1.0, resolution, dtype=np.float64)
+    coords = periodic_grid_coords(resolution)
     eval_coords = coords.copy()
     if resolution > 1:
         eps = 1e-10
         eval_coords[0] = eps
-        eval_coords[-1] = 1.0 - eps
     grid_x, grid_y = np.meshgrid(coords, coords, indexing="ij")
     eval_x, eval_y = np.meshgrid(eval_coords, eval_coords, indexing="ij")
     points = np.column_stack([eval_x.ravel(), eval_y.ravel(), np.zeros(resolution * resolution, dtype=np.float64)])
@@ -273,7 +323,7 @@ def build_mask(theta: np.ndarray, grid_xy: np.ndarray) -> np.ndarray:
 
 
 def build_forcing_scalar_grid(resolution: int, forcing_scale: float) -> np.ndarray:
-    coords = np.linspace(0.0, 1.0, resolution, dtype=np.float64)
+    coords = periodic_grid_coords(resolution)
     grid_x, grid_y = np.meshgrid(coords, coords, indexing="ij")
     phase = 2.0 * np.pi * (grid_x + grid_y)
     return forcing_scale * (np.sin(phase) + np.cos(phase))
@@ -283,6 +333,13 @@ def build_body_force_ufl(x_coord, forcing_scale: float):
     phase = 2.0 * np.pi * (x_coord[0] + x_coord[1])
     force_y = forcing_scale * (ufl.sin(phase) - ufl.cos(phase)) / (2.0 * np.pi)
     return ufl.as_vector((ufl.as_ufl(0.0), force_y))
+
+
+def build_chi_smooth(mask: np.ndarray, smooth_sigma: float) -> np.ndarray:
+    if smooth_sigma <= 0.0:
+        return mask.astype(np.float32)
+    smooth = gaussian_filter(mask.astype(np.float32), sigma=float(smooth_sigma), mode="nearest")
+    return np.clip(smooth, 0.0, 1.0).astype(np.float32)
 
 
 def locate_valid_points(msh, points: np.ndarray, mask: np.ndarray):
@@ -410,7 +467,8 @@ def build_problem(msh, facet_tags, dt: float, nu: float, gamma_drive: float, for
 
 
 def solve_one_sample(theta: np.ndarray, args: argparse.Namespace, rng: np.random.Generator):
-    msh, facet_tags = build_mesh(theta, float(args.mesh_size_min), float(args.mesh_size_max))
+    mesh_size_min, mesh_size_max = resolve_mesh_sizes(args)
+    msh, facet_tags = build_mesh(theta, mesh_size_min, mesh_size_max)
     state = build_problem(
         msh,
         facet_tags,
@@ -420,19 +478,22 @@ def solve_one_sample(theta: np.ndarray, args: argparse.Namespace, rng: np.random
         float(args.forcing_scale),
     )
 
-    coeffs = sample_stream_coefficients(rng, int(args.stream_modes), float(args.stream_scale))
-    state["u_prev"].interpolate(build_initial_velocity_callable(coeffs))
+    coords, points, grid_xy = build_regular_grid(int(args.grid_resolution))
+    initial_vorticity = sample_initial_vorticity_grf(
+        rng,
+        int(args.grid_resolution),
+        float(args.grf_alpha),
+        float(args.grf_tau),
+        float(args.initial_vorticity_scale),
+    )
+    initial_velocity_grid = velocity_from_vorticity_grid(initial_vorticity)
+    state["u_prev"].interpolate(build_initial_velocity_callable(initial_velocity_grid))
     state["u_prev"].x.scatter_forward()
 
-    coords, points, grid_xy = build_regular_grid(int(args.grid_resolution))
     mask = build_mask(theta, grid_xy)
+    chi_smooth = build_chi_smooth(mask, float(args.smooth_sigma))
     forcing_grid = build_forcing_scalar_grid(int(args.grid_resolution), float(args.forcing_scale))
     selected_indices, selected_points, selected_cells = locate_valid_points(msh, points, mask)
-
-    initial_velocity_grid = evaluate_function_on_grid(
-        state["u_prev"], int(args.grid_resolution), selected_indices, selected_points, selected_cells, value_size=2
-    )
-    initial_vorticity = compute_vorticity_from_velocity(initial_velocity_grid, coords, mask)
 
     n_steps = int(math.ceil(float(args.final_time) / float(args.dt)))
     if n_steps < int(args.record_steps):
@@ -489,6 +550,7 @@ def solve_one_sample(theta: np.ndarray, args: argparse.Namespace, rng: np.random
         "theta": theta.astype(np.float32),
         "t": times.astype(np.float32),
         "f": forcing_grid.astype(np.float32),
+        "chi_smooth": chi_smooth.astype(np.float32),
         "velocity_u": velocity_u,
         "velocity_v": velocity_v,
         "pressure": pressure,
@@ -503,12 +565,17 @@ def save_split(out_path: Path, split: str, payload: dict[str, np.ndarray], args:
         "theta": payload["theta"].astype(np.float32),
         "t": payload["t"].astype(np.float32),
         "f": payload["f"].astype(np.float32),
+        "chi_smooth": payload["chi_smooth"].astype(np.float32),
         "nu": np.asarray([args.nu], dtype=np.float32),
         "eta": np.asarray([args.eta], dtype=np.float32),
         "final_time": np.asarray([args.final_time], dtype=np.float32),
         "dt": np.asarray([args.dt], dtype=np.float32),
+        "delta_t": np.asarray([args.dt], dtype=np.float32),
         "gamma_drive": np.asarray([args.gamma_drive], dtype=np.float32),
         "forcing_scale": np.asarray([args.forcing_scale], dtype=np.float32),
+        "grf_alpha": np.asarray([args.grf_alpha], dtype=np.float32),
+        "grf_tau": np.asarray([args.grf_tau], dtype=np.float32),
+        "initial_vorticity_scale": np.asarray([args.initial_vorticity_scale], dtype=np.float32),
         "split": np.asarray([split], dtype=object),
     }
     if args.save_aux_fields:
@@ -609,6 +676,7 @@ def generate_split(
             "theta": theta_all,
             "t": t_all,
             "f": sample_payload["f"],
+            "chi_smooth": sample_payload["chi_smooth"],
             "velocity_u": velocity_u_all,
             "velocity_v": velocity_v_all,
             "pressure": pressure_all,

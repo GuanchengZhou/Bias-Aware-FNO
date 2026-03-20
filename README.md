@@ -30,6 +30,16 @@ cd /Users/zhougc/Desktop/IID/LRTOR_project/Bias_Aware_FNO
 
 Large datasets automatically fall back to an HDF5-backed `.mat` file when classic MAT v5 would exceed the 4 GB array limit. The existing training scripts and visualization notebook can read both formats.
 
+The FEniCSx generator now uses a Brinkman-aligned setup for:
+- Gaussian random field initial vorticity,
+- low-frequency forcing exported as `f`,
+- smoothed obstacle mask exported as `chi_smooth`.
+
+Useful controls:
+- `--initial-vorticity-scale`: make the initial condition more or less aggressive.
+- `--grf-alpha`, `--grf-tau`: change the GRF smoothness and correlation scale.
+- `--mesh-density`: directly control finite-element mesh density; larger values give finer gmsh meshes and override `--mesh-size-min/--mesh-size-max`.
+
 Smoke test:
 ```bash
 /Users/zhougc/miniconda3/envs/fenicsx-env/bin/python data_generation/navier_stokes_5holes/ns_2d_fenicsx.py \
@@ -39,8 +49,7 @@ Smoke test:
   --record-steps 10 \
   --final-time 1.0 \
   --dt 0.1 \
-  --mesh-size-min 0.10 \
-  --mesh-size-max 0.14
+  --mesh-density 10
 ```
 
 Legacy spectral baseline:
