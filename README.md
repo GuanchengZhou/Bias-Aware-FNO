@@ -85,3 +85,16 @@ Smoke test:
   --epochs 2 \
   --device cpu
 ```
+
+## Visualization Notebook
+Notebook path:
+```bash
+/Users/zhougc/Desktop/IID/LRTOR_project/Bias_Aware_FNO/output/jupyter-notebook/ns-5holes-fenicsx-dataset-visualization.ipynb
+```
+
+This notebook reads generated `.mat` files from `data/`, summarizes tensor shapes and metadata, and visualizes:
+- obstacle masks and hole geometry,
+- initial vorticity plus trajectory snapshots,
+- per-sample galleries,
+- geometry and dynamics statistics,
+- optional velocity/pressure auxiliary fields when generated with `--save-aux-fields`.

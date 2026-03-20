@@ -13,7 +13,9 @@ pred/
 image/
 
 output/jupyter-notebook/stokes-random-mesh-error-256/
+output/jupyter-notebook/ns-5holes-fenicsx-dataset-visualization/
 
 !output/
 !output/jupyter-notebook/
 !output/jupyter-notebook/stokes-random-mesh-error-256.ipynb
+!output/jupyter-notebook/ns-5holes-fenicsx-dataset-visualization.ipynb
