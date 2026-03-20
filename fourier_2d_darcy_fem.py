@@ -13,6 +13,10 @@ import scipy.io
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    tqdm = None
 
 from Adam import Adam
 from utilities3 import LpLoss, MatReader, UnitGaussianNormalizer, count_params
@@ -187,6 +191,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler-step", type=int, default=100)
     parser.add_argument("--scheduler-gamma", type=float, default=0.5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--test-every", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--save-sample-plot", action="store_true")
@@ -271,8 +276,13 @@ def main() -> None:
     path_image = REPO_ROOT / "image" / f"{experiment_name}_sample.png"
 
     last_sample = None
+    last_test_coarse_reference = float("nan")
+    last_test_fine = float("nan")
+    epoch_iterator = range(args.epochs)
+    if tqdm is not None:
+        epoch_iterator = tqdm(epoch_iterator, desc="Darcy FNO", dynamic_ncols=True)
 
-    for ep in range(args.epochs):
+    for ep in epoch_iterator:
         model.train()
         t1 = default_timer()
         train_l2_coarse = 0.0
@@ -291,46 +301,65 @@ def main() -> None:
             train_l2_coarse += loss.item()
             train_count += yy_coarse.shape[0]
 
-        model.eval()
-        test_l2_coarse_reference = 0.0
-        test_l2_fine = 0.0
-        test_count = 0
-        with torch.no_grad():
-            for xx, coeff_batch, yy_coarse, yy_fine in test_loader:
-                xx = xx.to(device)
-                yy_coarse = yy_coarse.to(device)
-                yy_fine = yy_fine.to(device)
-                pred = y_normalizer.decode(model(xx))
-
-                test_l2_coarse_reference += loss_fn(
-                    pred.reshape(pred.shape[0], -1),
-                    yy_coarse.reshape(yy_coarse.shape[0], -1),
-                ).item()
-                test_l2_fine += loss_fn(
-                    pred.reshape(pred.shape[0], -1),
-                    yy_fine.reshape(yy_fine.shape[0], -1),
-                ).item()
-                test_count += yy_coarse.shape[0]
-                last_sample = (
-                    coeff_batch[0],
-                    pred[0].cpu(),
-                    yy_coarse[0].cpu(),
-                    yy_fine[0].cpu(),
-                )
-
         scheduler.step()
         t2 = default_timer()
-        summary = (
-            f"{ep:04d} {t2 - t1:.4f} "
-            f"{train_l2_coarse / train_count:.6e} "
-            f"{test_l2_coarse_reference / test_count:.6e} "
-            f"{test_l2_fine / test_count:.6e}"
-        )
-        print(summary)
+        train_metric = train_l2_coarse / train_count
+        should_test = ((ep + 1) % args.test_every == 0) or (ep == args.epochs - 1)
+
+        train_summary = f"{ep:04d} {t2 - t1:.4f} {train_metric:.6e}"
         with path_train_err.open("a", encoding="utf-8") as handle:
-            handle.write(summary + "\n")
-        with path_test_err.open("a", encoding="utf-8") as handle:
-            handle.write(summary + "\n")
+            handle.write(train_summary + "\n")
+
+        if should_test:
+            model.eval()
+            test_l2_coarse_reference = 0.0
+            test_l2_fine = 0.0
+            test_count = 0
+            with torch.no_grad():
+                for xx, coeff_batch, yy_coarse, yy_fine in test_loader:
+                    xx = xx.to(device)
+                    yy_coarse = yy_coarse.to(device)
+                    yy_fine = yy_fine.to(device)
+                    pred = y_normalizer.decode(model(xx))
+
+                    test_l2_coarse_reference += loss_fn(
+                        pred.reshape(pred.shape[0], -1),
+                        yy_coarse.reshape(yy_coarse.shape[0], -1),
+                    ).item()
+                    test_l2_fine += loss_fn(
+                        pred.reshape(pred.shape[0], -1),
+                        yy_fine.reshape(yy_fine.shape[0], -1),
+                    ).item()
+                    test_count += yy_coarse.shape[0]
+                    last_sample = (
+                        coeff_batch[0],
+                        pred[0].cpu(),
+                        yy_coarse[0].cpu(),
+                        yy_fine[0].cpu(),
+                    )
+
+            last_test_coarse_reference = test_l2_coarse_reference / test_count
+            last_test_fine = test_l2_fine / test_count
+            test_summary = (
+                f"{ep:04d} {t2 - t1:.4f} "
+                f"{train_metric:.6e} "
+                f"{last_test_coarse_reference:.6e} "
+                f"{last_test_fine:.6e}"
+            )
+            if tqdm is not None:
+                tqdm.write(test_summary)
+            else:
+                print(test_summary)
+            with path_test_err.open("a", encoding="utf-8") as handle:
+                handle.write(test_summary + "\n")
+
+        if tqdm is not None:
+            epoch_iterator.set_postfix(
+                train_l2_coarse=f"{train_metric:.3e}",
+                test_l2_fine=f"{last_test_fine:.3e}" if np.isfinite(last_test_fine) else "pending",
+            )
+        elif not should_test:
+            print(train_summary)
 
     torch.save(model, path_model)
     print(f"Saved model -> {path_model}")
