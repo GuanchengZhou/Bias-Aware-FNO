@@ -2,6 +2,8 @@
 
 FNO-style training and evaluation scripts for random five-hole Navier-Stokes data.
 
+The repo now also includes an FNO-style Darcy Flow pipeline with paired coarse/fine FEniCSx FEM datasets.
+
 Data generation now uses `gmsh + dolfinx + PETSc` in `fenicsx-env`.
 Training and evaluation still use the original FNO-style PyTorch scripts in `torch_310`.
 
@@ -21,6 +23,9 @@ FEniCSx environment:
 - `data_generation/navier_stokes_5holes/ns_2d_brinkman.py`: legacy spectral baseline.
 - `fourier_2d_time_5holes.py`: recurrent one-step FNO training script.
 - `scripts/eval_2d_time_5holes.py`: rollout evaluation script.
+- `data_generation/darcy/darcy_fem_fenicsx.py`: paired coarse/fine Darcy FEM generator.
+- `fourier_2d_darcy_fem.py`: static FNO-Darcy training script with coarse supervision and fine testing.
+- `scripts/eval_2d_darcy_fem.py`: Darcy evaluation against coarse and fine targets on the shared grid.
 
 ## Data Generation
 ```bash
@@ -57,6 +62,34 @@ Legacy spectral baseline:
 /Users/zhougc/miniconda3/envs/torch_310/bin/python data_generation/navier_stokes_5holes/ns_2d_brinkman.py
 ```
 
+## Darcy Data Generation
+```bash
+/Users/zhougc/miniconda3/envs/fenicsx-env/bin/python data_generation/darcy/darcy_fem_fenicsx.py
+```
+
+Default behavior:
+- high-resolution coefficient field `coeff` follows the FNO-Darcy GRF threshold construction,
+- coarse/fine FEM solves use `P1` on `create_unit_square` meshes,
+- the default FEM meshes are `256 x 256` and `512 x 512`,
+- both FEM solutions are evaluated exactly onto the same `421 x 421` reference grid,
+- train targets are `sol_coarse`,
+- test targets are `sol_fine`.
+
+Useful controls:
+- `--coeff-resolution 421` sets the shared reference grid used for `coeff`, `sol_coarse`, and `sol_fine`.
+- `--coarse-n 256 --fine-n 512` sets the FEM mesh densities.
+- `--coeff-low 4 --coeff-high 12` changes the two-value medium.
+
+Smoke test:
+```bash
+/Users/zhougc/miniconda3/envs/fenicsx-env/bin/python data_generation/darcy/darcy_fem_fenicsx.py \
+  --coeff-resolution 129 \
+  --coarse-n 32 \
+  --fine-n 64 \
+  --n-train 4 \
+  --n-test 2
+```
+
 ## Training
 ```bash
 /Users/zhougc/miniconda3/envs/torch_310/bin/python fourier_2d_time_5holes.py
@@ -78,6 +111,33 @@ Smoke test:
   --save-sample-plot
 ```
 
+Darcy training:
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python fourier_2d_darcy_fem.py
+```
+
+Darcy smoke test:
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python fourier_2d_darcy_fem.py \
+  --ntrain 4 \
+  --ntest 2 \
+  --coeff-resolution 129 \
+  --coarse-n 32 \
+  --fine-n 64 \
+  --epochs 2 \
+  --batch-size 1 \
+  --device cpu \
+  --save-sample-plot
+```
+
+Darcy training uses:
+- `x_train = coeff`
+- `y_train = sol_coarse`
+- `x_test = coeff`
+- `y_test = sol_fine`
+
+There is no `sub` downsampling in the Darcy pipeline anymore.
+
 ## Evaluation
 ```bash
 /Users/zhougc/miniconda3/envs/torch_310/bin/python scripts/eval_2d_time_5holes.py
@@ -97,6 +157,24 @@ Smoke test:
   --device cpu
 ```
 
+Darcy evaluation:
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python scripts/eval_2d_darcy_fem.py
+```
+
+Darcy smoke test:
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python scripts/eval_2d_darcy_fem.py \
+  --ntrain 4 \
+  --ntest 2 \
+  --coeff-resolution 129 \
+  --coarse-n 32 \
+  --fine-n 64 \
+  --epochs 2 \
+  --batch-size 1 \
+  --device cpu
+```
+
 ## Visualization Notebook
 Notebook path:
 ```bash
@@ -109,3 +187,10 @@ This notebook reads generated `.mat` files from `data/`, summarizes tensor shape
 - per-sample galleries,
 - geometry and dynamics statistics,
 - optional velocity/pressure auxiliary fields when generated with `--save-aux-fields`.
+
+Darcy notebook path:
+```bash
+/Users/zhougc/Desktop/IID/LRTOR_project/Bias_Aware_FNO/output/jupyter-notebook/darcy-fem-coarse-fine-visualization.ipynb
+```
+
+The Darcy notebook reads paired train/test `.mat` files, shows coarse/fine mesh metadata, visualizes `coeff`, `sol_coarse`, `sol_fine`, `error_hf_lf`, and optionally compares saved predictions in `pred/`.

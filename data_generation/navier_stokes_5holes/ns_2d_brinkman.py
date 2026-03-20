@@ -333,6 +333,7 @@ def generate_split(
     sol_t = None
     for start in range(0, n_samples, int(args.batch_size)):
         end = min(start + int(args.batch_size), n_samples)
+        print(f"{start}-{end} / {n_samples}")
         batch_sol, batch_t = solver.solve(
             w0[start:end],
             forcing,

@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 
 .matplotlib/
+tmp/
 
 data/
 model/
@@ -14,8 +15,10 @@ image/
 
 output/jupyter-notebook/stokes-random-mesh-error-256/
 output/jupyter-notebook/ns-5holes-fenicsx-dataset-visualization/
+output/jupyter-notebook/darcy-fem-coarse-fine-visualization/
 
 !output/
 !output/jupyter-notebook/
 !output/jupyter-notebook/stokes-random-mesh-error-256.ipynb
 !output/jupyter-notebook/ns-5holes-fenicsx-dataset-visualization.ipynb
+!output/jupyter-notebook/darcy-fem-coarse-fine-visualization.ipynb
