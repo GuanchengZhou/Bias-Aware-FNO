@@ -74,8 +74,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mesh-size-min", type=float, default=0.05)
     parser.add_argument("--mesh-size-max", type=float, default=0.08)
-    parser.add_argument("--gamma-drive", type=float, default=0.25)
-    parser.add_argument("--forcing-scale", type=float, default=0.1)
+    parser.add_argument("--gamma-drive", type=float, default=0.0)
+    parser.add_argument("--forcing-scale", type=float, default=1.25)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-holes", type=int, default=5)
     parser.add_argument("--radius-min", type=float, default=0.05)
@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hole-gap-min", type=float, default=0.03)
     parser.add_argument("--max-placement-attempts", type=int, default=2000)
     parser.add_argument("--stream-modes", type=int, default=4)
-    parser.add_argument("--stream-scale", type=float, default=1.0)
+    parser.add_argument("--stream-scale", type=float, default=12.0)
     parser.add_argument("--save-aux-fields", action="store_true")
     parser.add_argument("--ood-radius-min", type=float, default=None)
     parser.add_argument("--ood-radius-max", type=float, default=None)
@@ -281,8 +281,8 @@ def build_forcing_scalar_grid(resolution: int, forcing_scale: float) -> np.ndarr
 
 def build_body_force_ufl(x_coord, forcing_scale: float):
     phase = 2.0 * np.pi * (x_coord[0] + x_coord[1])
-    force_x = forcing_scale * (ufl.sin(phase) + ufl.cos(phase))
-    return ufl.as_vector((force_x, ufl.as_ufl(0.0)))
+    force_y = forcing_scale * (ufl.sin(phase) - ufl.cos(phase)) / (2.0 * np.pi)
+    return ufl.as_vector((ufl.as_ufl(0.0), force_y))
 
 
 def locate_valid_points(msh, points: np.ndarray, mask: np.ndarray):
