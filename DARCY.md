@@ -278,6 +278,89 @@ correction run 的主要测试输出包括：
 - `residual_corrected`
 - `flux_error_corrected`
 
+## 8. Bayesian / VDN-lite 扩展
+
+在当前 deterministic correction baseline 之上，这个仓库还支持一个并行的 Bayesian 分支。它不改数据，也不改 Stage 1，而是在现有 structured correction 上增加 stochastic latent bias 与逐点方差头。
+
+核心思路是：
+
+\[
+\beta_h = \mu_\beta + \exp\!\left(\tfrac12 \log \sigma_\beta^2\right)\odot \varepsilon,
+\qquad
+\varepsilon \sim \mathcal N(0, I),
+\]
+
+\[
+A_h(a_h) b_h = D_h \tau_h(\beta_h),
+\qquad
+\hat u_h = \tilde u_h + b_h.
+\]
+
+这里：
+
+- backbone 预测 \(\tilde u_h\) 仍作为 clean mean；
+- correction net 额外输出：
+  - `beta_mu`
+  - `beta_logvar`
+- uncertainty head 输出：
+  - `pred_logvar`
+  - `pred_std = exp(0.5 * pred_logvar)`
+
+在实现上，这是一个 VDN-lite 版本：
+
+- 不引入新的潜变量语义；
+- 不切换到新的 `exp(g)` 数据生成；
+- 只是在现有 shared-grid correction operators 上增加 stochastic `beta` 和 observation variance。
+
+## 9. 消融开关
+
+correction 分支不再通过多份脚本做消融，而是统一通过 CLI flags 控制：
+
+- `--ablation direct-bias`
+  - 直接输出 \(b_h\)，跳过 structured \(\tau_h\) 和 correction PDE solve
+- `--ablation direct-flux`
+  - 直接输出 \(\tau_h\)，保留 correction PDE solve，但不经过 `beta_bulk / beta_n / beta_t / beta_b`
+- `--disable-interface-correction`
+  - 去掉 interface correction
+- `--disable-boundary-correction`
+  - 去掉 boundary correction
+- `--disable-flux-loss`
+  - 训练时移除 flux loss，但评测仍然继续报告 flux 指标
+
+因此当前实验语义是：
+
+- `deterministic + none`：structured correction baseline
+- `bayesian + none`：VDN-lite Bayesian correction
+- 其余 flags：结构化消融
+
+## 10. 当前 correction 训练入口
+
+当前 correction 训练脚本是：
+
+- [fourier_2d_darcy_correction.py](/Users/zhougc/Desktop/IID/LRTOR_project/Bias_Aware_FNO/fourier_2d_darcy_correction.py)
+
+它固定遵循：
+
+1. Stage 1 完全沿用 baseline Darcy-FNO；
+2. Stage 2 / Stage 3 只使用训练集前 `100` 个样本；
+3. coarse target 约束 backbone；
+4. fine target 约束 corrected output；
+5. 若启用 Bayesian 变体，则在 Stage 2 / 3 中额外加入 `NLL + KL_beta + KL_var` 项。
+
+对应评测脚本是：
+
+- [eval_2d_darcy_correction.py](/Users/zhougc/Desktop/IID/LRTOR_project/Bias_Aware_FNO/scripts/eval_2d_darcy_correction.py)
+
+其中：
+
+- deterministic run 会继续输出 `pred_backbone` 和 `pred_corrected`
+- Bayesian run 还会输出 `pred_mean`、`pred_std`、`pred_logvar`、`beta_mu`、`beta_logvar`
+- `eval_metrics.json` 中会额外记录：
+  - `nll_mean`
+  - `calibration_bins`
+  - `ece_like_error`
+  - `variance_error_correlation`
+
 并在 `eval_metrics.json` 中记录：
 
 - `backbone_fine_l2_mean`

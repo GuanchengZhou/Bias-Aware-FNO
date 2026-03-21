@@ -170,6 +170,11 @@ def masked_mean_square(field: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (field.square() * mask).sum(dim=(1, 2)) / denom
 
 
+def masked_mean(field: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    denom = torch.clamp(mask.sum(dim=(1, 2)), min=1.0)
+    return (field * mask).sum(dim=(1, 2)) / denom
+
+
 def masked_face_mean_square(qx: torch.Tensor, qy: torch.Tensor, mask_x: torch.Tensor, mask_y: torch.Tensor) -> torch.Tensor:
     denom = torch.clamp(mask_x.sum(dim=(1, 2)) + mask_y.sum(dim=(1, 2)), min=1.0)
     numer = (qx.square() * mask_x).sum(dim=(1, 2)) + (qy.square() * mask_y).sum(dim=(1, 2))
@@ -186,6 +191,20 @@ def batch_dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return (x.reshape(x.shape[0], -1) * y.reshape(y.shape[0], -1)).sum(dim=1)
 
 
+def kl_standard_normal(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (torch.exp(logvar) + mu.square() - 1.0 - logvar).mean(dim=tuple(range(1, mu.ndim)))
+
+
+def latent_channels_for_ablation(ablation: str) -> int:
+    if ablation == "none":
+        return 4
+    if ablation == "direct-bias":
+        return 1
+    if ablation == "direct-flux":
+        return 2
+    raise ValueError(f"Unsupported ablation: {ablation}")
+
+
 @dataclass
 class LossBundle:
     total: torch.Tensor
@@ -195,6 +214,9 @@ class LossBundle:
     flux: torch.Tensor
     reg: torch.Tensor
     mask: torch.Tensor
+    nll: torch.Tensor
+    kl_beta: torch.Tensor
+    kl_var: torch.Tensor
 
 
 class FlexibleFNO2d(nn.Module):
@@ -246,15 +268,63 @@ class BackboneWrapper(nn.Module):
         return self.model(x)
 
 
+def init_small_output(linear: nn.Linear, *, std: float = 1e-3, bias: float = 0.0) -> None:
+    nn.init.normal_(linear.weight, mean=0.0, std=std)
+    nn.init.constant_(linear.bias, bias)
+
+
 class StructuredCorrectionNet(nn.Module):
     def __init__(self, modes: int, width: int):
         super().__init__()
         self.model = FlexibleFNO2d(in_channels=7, out_channels=4, modes1=modes, modes2=modes, width=width)
-        nn.init.zeros_(self.model.fc2.weight)
-        nn.init.zeros_(self.model.fc2.bias)
+        # Avoid the tau=0 -> rhs=0 -> zero-gradient fixed point at initialization.
+        init_small_output(self.model.fc2, std=1e-3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return 0.1 * torch.tanh(self.model(x))
+
+
+class DeterministicLatentHead(nn.Module):
+    def __init__(self, modes: int, width: int, out_channels: int, init_bias: float = 0.0):
+        super().__init__()
+        self.model = FlexibleFNO2d(in_channels=7, out_channels=out_channels, modes1=modes, modes2=modes, width=width)
+        init_small_output(self.model.fc2, std=1e-3, bias=init_bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return 0.1 * torch.tanh(self.model(x))
+
+
+class BayesianLatentHead(nn.Module):
+    def __init__(self, modes: int, width: int, latent_channels: int):
+        super().__init__()
+        self.mu_head = FlexibleFNO2d(in_channels=7, out_channels=latent_channels, modes1=modes, modes2=modes, width=width)
+        self.logvar_head = FlexibleFNO2d(
+            in_channels=7,
+            out_channels=latent_channels,
+            modes1=modes,
+            modes2=modes,
+            width=width,
+        )
+        nn.init.zeros_(self.mu_head.fc2.weight)
+        nn.init.zeros_(self.mu_head.fc2.bias)
+        nn.init.zeros_(self.logvar_head.fc2.weight)
+        nn.init.constant_(self.logvar_head.fc2.bias, -8.0)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mu = 0.1 * torch.tanh(self.mu_head(x))
+        logvar = torch.clamp(self.logvar_head(x), min=-10.0, max=4.0)
+        return mu, logvar
+
+
+class UncertaintyHead(nn.Module):
+    def __init__(self, modes: int, width: int):
+        super().__init__()
+        self.model = FlexibleFNO2d(in_channels=7, out_channels=1, modes1=modes, modes2=modes, width=width)
+        nn.init.zeros_(self.model.fc2.weight)
+        nn.init.constant_(self.model.fc2.bias, -6.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(self.model(x).squeeze(-1), min=-10.0, max=4.0)
 
 
 class StructuredFluxCorrectionLayer(nn.Module):
@@ -280,13 +350,14 @@ class StructuredFluxCorrectionLayer(nn.Module):
         size = coeff.shape[-1]
         device = coeff.device
         dtype = coeff.dtype
+        boundary_nx, boundary_ny = boundary_normals(size, device, dtype)
         return {
             "interior_mask": interior_mask(size, device, dtype),
             "x_face_mask": x_face_mask(size, device, dtype),
             "y_face_mask": y_face_mask(size, device, dtype),
             "d_boundary": boundary_distance(size, device, dtype).unsqueeze(0),
-            "boundary_nx": boundary_normals(size, device, dtype)[0].unsqueeze(0),
-            "boundary_ny": boundary_normals(size, device, dtype)[1].unsqueeze(0),
+            "boundary_nx": boundary_nx.unsqueeze(0),
+            "boundary_ny": boundary_ny.unsqueeze(0),
         }
 
     def _apply_dirichlet_operator(self, coeff: torch.Tensor, field: torch.Tensor, h: float) -> torch.Tensor:
@@ -319,7 +390,71 @@ class StructuredFluxCorrectionLayer(nn.Module):
 
         return enforce_zero_boundary(solution)
 
-    def forward(self, coeff: torch.Tensor, u_backbone: torch.Tensor, beta: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _finalize_outputs(
+        self,
+        coeff: torch.Tensor,
+        u_backbone: torch.Tensor,
+        tau_x: torch.Tensor,
+        tau_y: torch.Tensor,
+        helpers: dict[str, torch.Tensor],
+        *,
+        tau_bulk_x: torch.Tensor,
+        tau_bulk_y: torch.Tensor,
+        tau_int_x: torch.Tensor,
+        tau_int_y: torch.Tensor,
+        tau_bdry_x: torch.Tensor,
+        tau_bdry_y: torch.Tensor,
+        rho_int_x: torch.Tensor,
+        rho_int_y: torch.Tensor,
+        rho_bdry_x: torch.Tensor,
+        rho_bdry_y: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        h = 1.0 / float(coeff.shape[-1] - 1)
+        rhs = divergence(tau_x, tau_y, h)
+        correction = self._cg_solve(coeff, rhs, h)
+        u_corrected = enforce_zero_boundary(u_backbone + correction)
+
+        q_backbone_x, q_backbone_y = darcy_flux(coeff, u_backbone, h)
+        q_corrected_x, q_corrected_y = darcy_flux(coeff, u_corrected, h)
+        residual_backbone = 1.0 - darcy_operator(coeff, u_backbone, h)
+        residual_corrected = darcy_operator(coeff, u_corrected, h) - 1.0
+
+        return {
+            "u_corrected": u_corrected,
+            "b_h": correction,
+            "tau_x": tau_x,
+            "tau_y": tau_y,
+            "tau_bulk_x": tau_bulk_x,
+            "tau_bulk_y": tau_bulk_y,
+            "tau_int_x": tau_int_x,
+            "tau_int_y": tau_int_y,
+            "tau_bdry_x": tau_bdry_x,
+            "tau_bdry_y": tau_bdry_y,
+            "rho_int_x": rho_int_x,
+            "rho_int_y": rho_int_y,
+            "rho_bdry_x": rho_bdry_x,
+            "rho_bdry_y": rho_bdry_y,
+            "residual_backbone": residual_backbone,
+            "residual_corrected": residual_corrected,
+            "flux_backbone_x": q_backbone_x,
+            "flux_backbone_y": q_backbone_y,
+            "flux_corrected_x": q_corrected_x,
+            "flux_corrected_y": q_corrected_y,
+            "interior_mask": helpers["interior_mask"],
+            "x_face_mask": helpers["x_face_mask"],
+            "y_face_mask": helpers["y_face_mask"],
+            "d_boundary": helpers["d_boundary"],
+        }
+
+    def from_beta(
+        self,
+        coeff: torch.Tensor,
+        u_backbone: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        disable_interface_correction: bool = False,
+        disable_boundary_correction: bool = False,
+    ) -> dict[str, torch.Tensor]:
         size = coeff.shape[-1]
         h = 1.0 / float(size - 1)
         helpers = self._grid_helpers(coeff)
@@ -372,38 +507,93 @@ class StructuredFluxCorrectionLayer(nn.Module):
         tau_bulk_x = beta_bulk_x * (h**2) * coeff_x * lap_grad_x
         tau_bulk_y = beta_bulk_y * (h**2) * coeff_y * lap_grad_y
 
-        tau_int_x = rho_int_x * (beta_n_x * abs_normal_x + beta_t_x * (1.0 - abs_normal_x)) * base_flux_x
-        tau_int_y = rho_int_y * (beta_n_y * abs_normal_y + beta_t_y * (1.0 - abs_normal_y)) * base_flux_y
+        if disable_interface_correction:
+            tau_int_x = torch.zeros_like(base_flux_x)
+            tau_int_y = torch.zeros_like(base_flux_y)
+        else:
+            tau_int_x = rho_int_x * (beta_n_x * abs_normal_x + beta_t_x * (1.0 - abs_normal_x)) * base_flux_x
+            tau_int_y = rho_int_y * (beta_n_y * abs_normal_y + beta_t_y * (1.0 - abs_normal_y)) * base_flux_y
 
-        tau_bdry_x = rho_bdry_x * beta_b_x * abs_boundary_nx * base_flux_x
-        tau_bdry_y = rho_bdry_y * beta_b_y * abs_boundary_ny * base_flux_y
+        if disable_boundary_correction:
+            tau_bdry_x = torch.zeros_like(base_flux_x)
+            tau_bdry_y = torch.zeros_like(base_flux_y)
+        else:
+            tau_bdry_x = rho_bdry_x * beta_b_x * abs_boundary_nx * base_flux_x
+            tau_bdry_y = rho_bdry_y * beta_b_y * abs_boundary_ny * base_flux_y
 
         tau_x = tau_bulk_x + tau_int_x + tau_bdry_x
         tau_y = tau_bulk_y + tau_int_y + tau_bdry_y
-        rhs = divergence(tau_x, tau_y, h)
-        correction = self._cg_solve(coeff, rhs, h)
+
+        return self._finalize_outputs(
+            coeff,
+            u_backbone,
+            tau_x,
+            tau_y,
+            helpers,
+            tau_bulk_x=tau_bulk_x,
+            tau_bulk_y=tau_bulk_y,
+            tau_int_x=tau_int_x,
+            tau_int_y=tau_int_y,
+            tau_bdry_x=tau_bdry_x,
+            tau_bdry_y=tau_bdry_y,
+            rho_int_x=rho_int_x,
+            rho_int_y=rho_int_y,
+            rho_bdry_x=rho_bdry_x,
+            rho_bdry_y=rho_bdry_y,
+        )
+
+    def from_direct_flux(self, coeff: torch.Tensor, u_backbone: torch.Tensor, tau_cell: torch.Tensor) -> dict[str, torch.Tensor]:
+        helpers = self._grid_helpers(coeff)
+        tau_x = cell_to_face_x(tau_cell[..., 0])
+        tau_y = cell_to_face_y(tau_cell[..., 1])
+        zeros_x = torch.zeros_like(tau_x)
+        zeros_y = torch.zeros_like(tau_y)
+        return self._finalize_outputs(
+            coeff,
+            u_backbone,
+            tau_x,
+            tau_y,
+            helpers,
+            tau_bulk_x=tau_x,
+            tau_bulk_y=tau_y,
+            tau_int_x=zeros_x,
+            tau_int_y=zeros_y,
+            tau_bdry_x=zeros_x,
+            tau_bdry_y=zeros_y,
+            rho_int_x=torch.zeros_like(tau_x),
+            rho_int_y=torch.zeros_like(tau_y),
+            rho_bdry_x=torch.zeros_like(tau_x),
+            rho_bdry_y=torch.zeros_like(tau_y),
+        )
+
+    def from_direct_bias(self, coeff: torch.Tensor, u_backbone: torch.Tensor, bias: torch.Tensor) -> dict[str, torch.Tensor]:
+        helpers = self._grid_helpers(coeff)
+        correction = enforce_zero_boundary(bias)
         u_corrected = enforce_zero_boundary(u_backbone + correction)
+        h = 1.0 / float(coeff.shape[-1] - 1)
 
         q_backbone_x, q_backbone_y = darcy_flux(coeff, u_backbone, h)
         q_corrected_x, q_corrected_y = darcy_flux(coeff, u_corrected, h)
         residual_backbone = 1.0 - darcy_operator(coeff, u_backbone, h)
         residual_corrected = darcy_operator(coeff, u_corrected, h) - 1.0
+        tau_x = torch.zeros((bias.shape[0], bias.shape[1] - 1, bias.shape[2]), device=bias.device, dtype=bias.dtype)
+        tau_y = torch.zeros((bias.shape[0], bias.shape[1], bias.shape[2] - 1), device=bias.device, dtype=bias.dtype)
 
         return {
             "u_corrected": u_corrected,
             "b_h": correction,
             "tau_x": tau_x,
             "tau_y": tau_y,
-            "tau_bulk_x": tau_bulk_x,
-            "tau_bulk_y": tau_bulk_y,
-            "tau_int_x": tau_int_x,
-            "tau_int_y": tau_int_y,
-            "tau_bdry_x": tau_bdry_x,
-            "tau_bdry_y": tau_bdry_y,
-            "rho_int_x": rho_int_x,
-            "rho_int_y": rho_int_y,
-            "rho_bdry_x": rho_bdry_x,
-            "rho_bdry_y": rho_bdry_y,
+            "tau_bulk_x": torch.zeros_like(tau_x),
+            "tau_bulk_y": torch.zeros_like(tau_y),
+            "tau_int_x": torch.zeros_like(tau_x),
+            "tau_int_y": torch.zeros_like(tau_y),
+            "tau_bdry_x": torch.zeros_like(tau_x),
+            "tau_bdry_y": torch.zeros_like(tau_y),
+            "rho_int_x": torch.zeros_like(tau_x),
+            "rho_int_y": torch.zeros_like(tau_y),
+            "rho_bdry_x": torch.zeros_like(tau_x),
+            "rho_bdry_y": torch.zeros_like(tau_y),
             "residual_backbone": residual_backbone,
             "residual_corrected": residual_corrected,
             "flux_backbone_x": q_backbone_x,
@@ -432,6 +622,10 @@ class DarcyFNOWithCorrection(nn.Module):
         y_std: torch.Tensor,
         cg_max_iter: int,
         cg_tol: float,
+        variant: str = "deterministic",
+        ablation: str = "none",
+        disable_interface_correction: bool = False,
+        disable_boundary_correction: bool = False,
         normalizer_eps: float = 1e-5,
     ):
         super().__init__()
@@ -440,11 +634,28 @@ class DarcyFNOWithCorrection(nn.Module):
         self.backbone_width = int(backbone_width)
         self.correction_modes = int(correction_modes)
         self.correction_width = int(correction_width)
+        self.variant = str(variant)
+        self.ablation = str(ablation)
+        self.disable_interface_correction = bool(disable_interface_correction)
+        self.disable_boundary_correction = bool(disable_boundary_correction)
         self.normalizer_eps = float(normalizer_eps)
 
         self.backbone = BackboneWrapper(backbone_modes, backbone_width)
-        self.correction_net = StructuredCorrectionNet(correction_modes, correction_width)
         self.correction_layer = StructuredFluxCorrectionLayer(cg_max_iter=cg_max_iter, cg_tol=cg_tol)
+        self.correction_net = StructuredCorrectionNet(correction_modes, correction_width)
+
+        self.latent_channels = latent_channels_for_ablation(self.ablation)
+        self.direct_head = None
+        self.bayesian_latent = None
+        self.uncertainty_head = None
+        if self.variant == "deterministic":
+            if self.ablation != "none":
+                self.direct_head = DeterministicLatentHead(correction_modes, correction_width, self.latent_channels)
+        elif self.variant == "bayesian":
+            self.bayesian_latent = BayesianLatentHead(correction_modes, correction_width, self.latent_channels)
+            self.uncertainty_head = UncertaintyHead(correction_modes, correction_width)
+        else:
+            raise ValueError(f"Unsupported variant: {self.variant}")
 
         self.register_buffer("x_mean", x_mean.clone())
         self.register_buffer("x_std", x_std.clone())
@@ -462,10 +673,7 @@ class DarcyFNOWithCorrection(nn.Module):
         grid = make_grid(coeff.shape[-1], coeff.device, coeff.dtype).unsqueeze(0).expand(coeff.shape[0], -1, -1, -1)
         return torch.cat([coeff_norm.unsqueeze(-1), grid], dim=-1)
 
-    def forward(self, coeff: torch.Tensor) -> dict[str, torch.Tensor]:
-        backbone_pred_norm = self.backbone(self._backbone_input(coeff))
-        u_backbone = enforce_zero_boundary(self.decode_solution(backbone_pred_norm))
-
+    def _build_features(self, coeff: torch.Tensor, u_backbone: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         size = coeff.shape[-1]
         h = 1.0 / float(size - 1)
         residual_backbone = 1.0 - darcy_operator(coeff, u_backbone, h)
@@ -488,10 +696,114 @@ class DarcyFNOWithCorrection(nn.Module):
             ],
             dim=-1,
         )
-        beta = self.correction_net(features)
-        correction_outputs = self.correction_layer(coeff, u_backbone, beta)
-        correction_outputs["u_backbone"] = u_backbone
-        correction_outputs["beta"] = beta
+        aux = {
+            "residual_backbone": residual_backbone,
+            "lap": lap,
+            "grad_u_mag": grad_u_mag,
+            "grad_log_a_mag": grad_log_a_mag,
+            "d_boundary": d_boundary,
+        }
+        return features, aux
+
+    def _apply_latent(self, coeff: torch.Tensor, u_backbone: torch.Tensor, latent: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.ablation == "none":
+            return self.correction_layer.from_beta(
+                coeff,
+                u_backbone,
+                latent,
+                disable_interface_correction=self.disable_interface_correction,
+                disable_boundary_correction=self.disable_boundary_correction,
+            )
+        if self.ablation == "direct-flux":
+            return self.correction_layer.from_direct_flux(coeff, u_backbone, latent)
+        if self.ablation == "direct-bias":
+            return self.correction_layer.from_direct_bias(coeff, u_backbone, latent.squeeze(-1) if latent.shape[-1] == 1 else latent[..., 0])
+        raise ValueError(f"Unsupported ablation: {self.ablation}")
+
+    def forward(self, coeff: torch.Tensor, *, mc_samples: int = 1) -> dict[str, torch.Tensor]:
+        backbone_pred_norm = self.backbone(self._backbone_input(coeff))
+        u_backbone = enforce_zero_boundary(self.decode_solution(backbone_pred_norm))
+        features, aux = self._build_features(coeff, u_backbone)
+
+        if self.variant == "deterministic":
+            if self.ablation == "none":
+                latent = self.correction_net(features)
+            else:
+                latent = self.direct_head(features)
+            correction_outputs = self._apply_latent(coeff, u_backbone, latent)
+            correction_outputs.update(
+                {
+                    "u_backbone": u_backbone,
+                    "beta": latent if self.ablation == "none" else None,
+                    "beta_mu": latent if self.ablation == "none" else latent,
+                    "beta_logvar": None,
+                    "pred_mean": correction_outputs["u_corrected"],
+                    "pred_std": torch.zeros_like(correction_outputs["u_corrected"]),
+                    "pred_logvar": torch.zeros_like(correction_outputs["u_corrected"]),
+                    "u_corrected_mean": correction_outputs["u_corrected"],
+                    "u_corrected_samples": correction_outputs["u_corrected"].unsqueeze(0),
+                    "sample_b_h": correction_outputs["b_h"].unsqueeze(0),
+                    "sample_tau_x": correction_outputs["tau_x"].unsqueeze(0),
+                    "sample_tau_y": correction_outputs["tau_y"].unsqueeze(0),
+                }
+            )
+            correction_outputs.update(aux)
+            return correction_outputs
+
+        beta_mu, beta_logvar = self.bayesian_latent(features)
+        pred_logvar = self.uncertainty_head(features)
+        sample_count = max(int(mc_samples), 1)
+
+        sample_outputs = []
+        for _ in range(sample_count):
+            epsilon = torch.randn_like(beta_mu)
+            latent = beta_mu + torch.exp(0.5 * beta_logvar) * epsilon
+            sample_outputs.append(self._apply_latent(coeff, u_backbone, latent))
+
+        u_samples = torch.stack([item["u_corrected"] for item in sample_outputs], dim=0)
+        b_samples = torch.stack([item["b_h"] for item in sample_outputs], dim=0)
+        tau_x_samples = torch.stack([item["tau_x"] for item in sample_outputs], dim=0)
+        tau_y_samples = torch.stack([item["tau_y"] for item in sample_outputs], dim=0)
+
+        correction_outputs = {
+            "u_backbone": u_backbone,
+            "u_corrected": u_samples.mean(dim=0),
+            "u_corrected_mean": u_samples.mean(dim=0),
+            "u_corrected_samples": u_samples,
+            "pred_mean": u_samples.mean(dim=0),
+            "pred_logvar": pred_logvar,
+            "pred_std": torch.exp(0.5 * pred_logvar),
+            "beta_mu": beta_mu,
+            "beta_logvar": beta_logvar,
+            "beta": beta_mu,
+            "b_h": b_samples.mean(dim=0),
+            "sample_b_h": b_samples,
+            "tau_x": tau_x_samples.mean(dim=0),
+            "tau_y": tau_y_samples.mean(dim=0),
+            "sample_tau_x": tau_x_samples,
+            "sample_tau_y": tau_y_samples,
+            "tau_bulk_x": torch.stack([item["tau_bulk_x"] for item in sample_outputs], dim=0).mean(dim=0),
+            "tau_bulk_y": torch.stack([item["tau_bulk_y"] for item in sample_outputs], dim=0).mean(dim=0),
+            "tau_int_x": torch.stack([item["tau_int_x"] for item in sample_outputs], dim=0).mean(dim=0),
+            "tau_int_y": torch.stack([item["tau_int_y"] for item in sample_outputs], dim=0).mean(dim=0),
+            "tau_bdry_x": torch.stack([item["tau_bdry_x"] for item in sample_outputs], dim=0).mean(dim=0),
+            "tau_bdry_y": torch.stack([item["tau_bdry_y"] for item in sample_outputs], dim=0).mean(dim=0),
+            "rho_int_x": sample_outputs[0]["rho_int_x"],
+            "rho_int_y": sample_outputs[0]["rho_int_y"],
+            "rho_bdry_x": sample_outputs[0]["rho_bdry_x"],
+            "rho_bdry_y": sample_outputs[0]["rho_bdry_y"],
+            "residual_backbone": sample_outputs[0]["residual_backbone"],
+            "residual_corrected": torch.stack([item["residual_corrected"] for item in sample_outputs], dim=0).mean(dim=0),
+            "flux_backbone_x": sample_outputs[0]["flux_backbone_x"],
+            "flux_backbone_y": sample_outputs[0]["flux_backbone_y"],
+            "flux_corrected_x": torch.stack([item["flux_corrected_x"] for item in sample_outputs], dim=0).mean(dim=0),
+            "flux_corrected_y": torch.stack([item["flux_corrected_y"] for item in sample_outputs], dim=0).mean(dim=0),
+            "interior_mask": sample_outputs[0]["interior_mask"],
+            "x_face_mask": sample_outputs[0]["x_face_mask"],
+            "y_face_mask": sample_outputs[0]["y_face_mask"],
+            "d_boundary": sample_outputs[0]["d_boundary"],
+        }
+        correction_outputs.update(aux)
         return correction_outputs
 
 
@@ -508,6 +820,10 @@ def build_correction_model(
     y_std: torch.Tensor,
     cg_max_iter: int,
     cg_tol: float,
+    variant: str = "deterministic",
+    ablation: str = "none",
+    disable_interface_correction: bool = False,
+    disable_boundary_correction: bool = False,
 ) -> DarcyFNOWithCorrection:
     return DarcyFNOWithCorrection(
         coeff_resolution=coeff_resolution,
@@ -521,6 +837,10 @@ def build_correction_model(
         y_std=y_std,
         cg_max_iter=cg_max_iter,
         cg_tol=cg_tol,
+        variant=variant,
+        ablation=ablation,
+        disable_interface_correction=disable_interface_correction,
+        disable_boundary_correction=disable_boundary_correction,
     )
 
 
@@ -530,12 +850,17 @@ def compute_losses(
     target_coarse: torch.Tensor,
     target_fine: torch.Tensor,
     *,
+    variant: str,
+    disable_flux_loss: bool,
     lambda_backbone: float,
     lambda_state: float,
     lambda_pde: float,
     lambda_flux: float,
     lambda_reg: float,
     lambda_mask: float,
+    lambda_nll: float = 1.0,
+    lambda_kl_beta: float = 0.0,
+    lambda_kl_var: float = 0.0,
 ) -> tuple[LossBundle, dict[str, torch.Tensor]]:
     size = coeff.shape[-1]
     h = 1.0 / float(size - 1)
@@ -543,13 +868,14 @@ def compute_losses(
     face_mask_x = outputs["x_face_mask"].expand(coeff.shape[0], -1, -1)
     face_mask_y = outputs["y_face_mask"].expand(coeff.shape[0], -1, -1)
 
+    prediction = outputs["pred_mean"] if variant == "bayesian" else outputs["u_corrected"]
     q_fine_x, q_fine_y = darcy_flux(coeff, target_fine, h)
     flux_error_x = outputs["flux_corrected_x"] - q_fine_x
     flux_error_y = outputs["flux_corrected_y"] - q_fine_y
 
     loss_backbone = masked_mean_square(outputs["u_backbone"] - target_coarse, interior).mean()
-    loss_state = masked_mean_square(outputs["u_corrected"] - target_fine, interior).mean()
-    loss_pde = masked_mean_square(outputs["residual_corrected"], interior).mean()
+    loss_state = masked_mean_square(prediction - target_fine, interior).mean()
+    loss_pde = masked_mean_square(darcy_operator(coeff, prediction, h) - 1.0, interior).mean()
     loss_flux = masked_face_mean_square(flux_error_x, flux_error_y, face_mask_x, face_mask_y).mean()
     loss_reg = smooth_face_norm(outputs["tau_x"], outputs["tau_y"]).mean()
     loss_mask = (
@@ -567,22 +893,45 @@ def compute_losses(
         )
     ).mean()
 
+    loss_nll = torch.zeros((), device=coeff.device, dtype=coeff.dtype)
+    loss_kl_beta = torch.zeros((), device=coeff.device, dtype=coeff.dtype)
+    loss_kl_var = torch.zeros((), device=coeff.device, dtype=coeff.dtype)
+
     total = (
         lambda_backbone * loss_backbone
         + lambda_state * loss_state
         + lambda_pde * loss_pde
-        + lambda_flux * loss_flux
+        + (0.0 if disable_flux_loss else lambda_flux * loss_flux)
         + lambda_reg * loss_reg
         + lambda_mask * loss_mask
     )
 
+    if variant == "bayesian":
+        pred_logvar = outputs["pred_logvar"]
+        pred_var = torch.exp(pred_logvar)
+        nll_map = 0.5 * (((target_fine - prediction).square() / torch.clamp(pred_var, min=1e-6)) + pred_logvar)
+        loss_nll = masked_mean(nll_map, interior).mean()
+        loss_kl_beta = kl_standard_normal(outputs["beta_mu"], outputs["beta_logvar"]).mean()
+        loss_kl_var = masked_mean(0.5 * (pred_var - 1.0 - pred_logvar), interior).mean()
+        total = (
+            lambda_backbone * loss_backbone
+            + lambda_nll * loss_nll
+            + lambda_pde * loss_pde
+            + (0.0 if disable_flux_loss else lambda_flux * loss_flux)
+            + lambda_reg * loss_reg
+            + lambda_mask * loss_mask
+            + lambda_kl_beta * loss_kl_beta
+            + lambda_kl_var * loss_kl_var
+        )
+
     diagnostics = {
-        "fine_l2_corrected": relative_l2(outputs["u_corrected"], target_fine),
+        "fine_l2_corrected": relative_l2(prediction, target_fine),
         "fine_l2_backbone": relative_l2(outputs["u_backbone"], target_fine),
         "coarse_l2_backbone": relative_l2(outputs["u_backbone"], target_coarse),
         "flux_error_x": flux_error_x,
         "flux_error_y": flux_error_y,
         "flux_error_magnitude": face_to_cell_magnitude(flux_error_x, flux_error_y),
+        "pred_std": outputs["pred_std"],
     }
     return (
         LossBundle(
@@ -593,6 +942,9 @@ def compute_losses(
             flux=loss_flux,
             reg=loss_reg,
             mask=loss_mask,
+            nll=loss_nll,
+            kl_beta=loss_kl_beta,
+            kl_var=loss_kl_var,
         ),
         diagnostics,
     )

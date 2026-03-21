@@ -166,6 +166,38 @@ Darcy correction training:
   --backbone-run-dir runs/<stage1_experiment_name>
 ```
 
+Bayesian correction variant:
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python fourier_2d_darcy_correction.py \
+  --backbone-run-dir runs/<stage1_experiment_name> \
+  --variant bayesian
+```
+
+Selected ablations:
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python fourier_2d_darcy_correction.py \
+  --backbone-run-dir runs/<stage1_experiment_name> \
+  --ablation direct-bias
+```
+
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python fourier_2d_darcy_correction.py \
+  --backbone-run-dir runs/<stage1_experiment_name> \
+  --ablation direct-flux
+```
+
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python fourier_2d_darcy_correction.py \
+  --backbone-run-dir runs/<stage1_experiment_name> \
+  --disable-interface-correction
+```
+
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python fourier_2d_darcy_correction.py \
+  --backbone-run-dir runs/<stage1_experiment_name> \
+  --disable-flux-loss
+```
+
 Darcy correction smoke test:
 ```bash
 /Users/zhougc/miniconda3/envs/torch_310/bin/python fourier_2d_darcy_correction.py \
@@ -182,6 +214,9 @@ Darcy correction uses:
 - Stage 2 and Stage 3 only on the first `100` training samples, or all samples if fewer than `100`
 - coarse supervision for the backbone term
 - fine supervision for the corrected output
+- `--variant deterministic` keeps the current structured correction baseline
+- `--variant bayesian` enables the VDN-lite branch with stochastic `beta`, predictive `pred_std`, and NLL / KL terms
+- ablations are configured through flags instead of separate scripts
 
 ## Evaluation
 ```bash
@@ -238,6 +273,14 @@ Darcy correction evaluation:
   --run-dir runs/<stage1_experiment_name>_correction
 ```
 
+The correction evaluator supports both deterministic and Bayesian runs. Bayesian outputs add:
+- `pred_mean`
+- `pred_std`
+- `pred_logvar`
+- `beta_mu`
+- `beta_logvar`
+- uncertainty-oriented metrics in `eval_metrics.json`
+
 ## Visualization Notebook
 Notebook path:
 ```bash
@@ -257,6 +300,16 @@ Darcy notebook path:
 ```
 
 The Darcy notebook reads paired train/test `.mat` files, shows coarse/fine mesh metadata, visualizes `coeff`, `sol_coarse`, `sol_fine`, `error_hf_lf`, and can also compare saved predictions from a run directory.
+
+Darcy correction notebook path:
+```bash
+/Users/zhougc/Desktop/IID/LRTOR_project/Bias_Aware_FNO/output/jupyter-notebook/darcy-fno-correction-visualization.ipynb
+```
+
+The correction notebook reads a correction run directory and supports:
+- deterministic runs with `pred_backbone` and `pred_corrected`
+- Bayesian runs with `pred_mean`, `pred_std`, uncertainty-vs-error scatter, and calibration summaries
+- ablation runs recorded through `config.json`
 
 Darcy correction notebook path:
 ```bash

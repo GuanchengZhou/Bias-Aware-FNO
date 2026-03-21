@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train Stage 2/3 Darcy structured correction on top of a pretrained Stage 1 backbone."""
+"""Train Stage 2/3 Darcy structured correction from a pretrained Stage 1 backbone."""
 
 from __future__ import annotations
 
@@ -41,6 +41,15 @@ os.environ.setdefault("MPLCONFIGDIR", str(MPLCONFIGDIR))
 import matplotlib.pyplot as plt
 
 
+def parse_bool(value: str) -> bool:
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
 def resolve_device(name: str) -> torch.device:
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -56,11 +65,13 @@ def load_fields(path: Path, count: int) -> tuple[torch.Tensor, torch.Tensor, tor
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Stage 2/3 Darcy structured correction from a Stage 1 run.")
+    parser = argparse.ArgumentParser(description="Train Stage 2/3 Darcy correction from a Stage 1 run.")
     parser.add_argument("--backbone-run-dir", type=Path, required=True)
-    parser.add_argument("--correction-train-samples", type=int, default=10)
-    parser.add_argument("--stage2-epochs", type=int, default=100)
-    parser.add_argument("--stage3-epochs", type=int, default=10)
+    parser.add_argument("--variant", choices=["deterministic", "bayesian"], default="deterministic")
+    parser.add_argument("--ablation", choices=["none", "direct-bias", "direct-flux"], default="none")
+    parser.add_argument("--correction-train-samples", type=int, default=100)
+    parser.add_argument("--stage2-epochs", type=int, default=50)
+    parser.add_argument("--stage3-epochs", type=int, default=50)
     parser.add_argument("--correction-modes", type=int, default=8)
     parser.add_argument("--correction-width", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -69,12 +80,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--cg-max-iter", type=int, default=30)
     parser.add_argument("--cg-tol", type=float, default=1e-6)
+    parser.add_argument("--mc-samples-train", type=int, default=2)
+    parser.add_argument("--mc-samples-eval", type=int, default=4)
+    parser.add_argument("--freeze-backbone-stage2", type=parse_bool, default=True)
+    parser.add_argument("--disable-interface-correction", action="store_true")
+    parser.add_argument("--disable-boundary-correction", action="store_true")
+    parser.add_argument("--disable-flux-loss", action="store_true")
     parser.add_argument("--lambda-backbone", type=float, default=0.5)
     parser.add_argument("--lambda-state", type=float, default=1.0)
     parser.add_argument("--lambda-pde", type=float, default=0.1)
     parser.add_argument("--lambda-flux", type=float, default=0.2)
     parser.add_argument("--lambda-reg", type=float, default=1e-4)
     parser.add_argument("--lambda-mask", type=float, default=1e-3)
+    parser.add_argument("--lambda-nll", type=float, default=1.0)
+    parser.add_argument("--lambda-kl-beta", type=float, default=1e-4)
+    parser.add_argument("--lambda-kl-var", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--save-sample-plot", action="store_true")
@@ -92,6 +112,21 @@ def load_backbone_state_dict(backbone_run_dir: Path) -> tuple[dict, dict, Path]:
     return config, state_dict, model_path
 
 
+def build_experiment_name(args: argparse.Namespace, backbone_run_dir: Path) -> str:
+    parts = [f"{backbone_run_dir.name}_correction"]
+    if args.variant != "deterministic":
+        parts.append(args.variant)
+    if args.ablation != "none":
+        parts.append(args.ablation)
+    if args.disable_interface_correction:
+        parts.append("no-interface")
+    if args.disable_boundary_correction:
+        parts.append("no-boundary")
+    if args.disable_flux_loss:
+        parts.append("no-flux-loss")
+    return "_".join(parts)
+
+
 def save_sample_plot(
     path: Path,
     coeff: torch.Tensor,
@@ -99,8 +134,8 @@ def save_sample_plot(
     corrected: torch.Tensor,
     target_fine: torch.Tensor,
     correction: torch.Tensor,
+    pred_std: torch.Tensor | None = None,
 ) -> None:
-    fig, axes = plt.subplots(1, 6, figsize=(24, 4))
     panels = [
         (coeff, "Coefficient", "viridis"),
         (backbone, "Backbone", "RdBu_r"),
@@ -109,6 +144,11 @@ def save_sample_plot(
         (target_fine - corrected, "Fine - Corrected", "RdBu_r"),
         (correction, "Correction b_h", "RdBu_r"),
     ]
+    if pred_std is not None:
+        panels.append((pred_std, "Predictive Std", "magma"))
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.2 * len(panels), 4))
+    if len(panels) == 1:
+        axes = [axes]
     for ax, (field, title, cmap) in zip(axes, panels):
         im = ax.imshow(field.cpu().numpy(), cmap=cmap)
         ax.set_title(title)
@@ -129,80 +169,7 @@ def collect_trainable_parameters(model) -> list[torch.nn.Parameter]:
     return [parameter for parameter in model.parameters() if parameter.requires_grad]
 
 
-def evaluate_model(
-    model,
-    loader,
-    device: torch.device,
-    *,
-    lambda_backbone: float,
-    lambda_state: float,
-    lambda_pde: float,
-    lambda_flux: float,
-    lambda_reg: float,
-    lambda_mask: float,
-):
-    model.eval()
-    totals = {
-        "loss_total": 0.0,
-        "loss_backbone_coarse": 0.0,
-        "loss_state_fine": 0.0,
-        "loss_pde": 0.0,
-        "loss_flux": 0.0,
-        "loss_reg": 0.0,
-        "loss_mask": 0.0,
-        "fine_l2_corrected": 0.0,
-        "fine_l2_backbone": 0.0,
-    }
-    count = 0
-    last_sample = None
-
-    with torch.no_grad():
-        for coeff, target_coarse, target_fine in loader:
-            coeff = coeff.to(device)
-            target_coarse = target_coarse.to(device)
-            target_fine = target_fine.to(device)
-
-            outputs = model(coeff)
-            losses, diagnostics = compute_losses(
-                outputs,
-                coeff,
-                target_coarse,
-                target_fine,
-                lambda_backbone=lambda_backbone,
-                lambda_state=lambda_state,
-                lambda_pde=lambda_pde,
-                lambda_flux=lambda_flux,
-                lambda_reg=lambda_reg,
-                lambda_mask=lambda_mask,
-            )
-
-            batch_size = coeff.shape[0]
-            totals["loss_total"] += losses.total.item() * batch_size
-            totals["loss_backbone_coarse"] += losses.backbone_coarse.item() * batch_size
-            totals["loss_state_fine"] += losses.state_fine.item() * batch_size
-            totals["loss_pde"] += losses.pde.item() * batch_size
-            totals["loss_flux"] += losses.flux.item() * batch_size
-            totals["loss_reg"] += losses.reg.item() * batch_size
-            totals["loss_mask"] += losses.mask.item() * batch_size
-            totals["fine_l2_corrected"] += diagnostics["fine_l2_corrected"].sum().item()
-            totals["fine_l2_backbone"] += diagnostics["fine_l2_backbone"].sum().item()
-            count += batch_size
-
-            last_sample = {
-                "coeff": coeff[0].detach().cpu(),
-                "u_backbone": outputs["u_backbone"][0].detach().cpu(),
-                "u_corrected": outputs["u_corrected"][0].detach().cpu(),
-                "target_fine": target_fine[0].detach().cpu(),
-                "b_h": outputs["b_h"][0].detach().cpu(),
-            }
-
-    if count == 0:
-        raise RuntimeError("Empty evaluation loader.")
-
-    return {key: value / count for key, value in totals.items()}, last_sample
-
-
-def stage_fieldnames() -> list[str]:
+def metric_fieldnames() -> list[str]:
     return [
         "epoch",
         "time_sec",
@@ -213,9 +180,97 @@ def stage_fieldnames() -> list[str]:
         "loss_flux",
         "loss_reg",
         "loss_mask",
+        "loss_nll",
+        "loss_kl_beta",
+        "loss_kl_var",
         "fine_l2_corrected",
         "fine_l2_backbone",
     ]
+
+
+def aggregate_loss_row(losses, diagnostics, batch_size: int) -> dict[str, float]:
+    return {
+        "loss_total": losses.total.item() * batch_size,
+        "loss_backbone_coarse": losses.backbone_coarse.item() * batch_size,
+        "loss_state_fine": losses.state_fine.item() * batch_size,
+        "loss_pde": losses.pde.item() * batch_size,
+        "loss_flux": losses.flux.item() * batch_size,
+        "loss_reg": losses.reg.item() * batch_size,
+        "loss_mask": losses.mask.item() * batch_size,
+        "loss_nll": losses.nll.item() * batch_size,
+        "loss_kl_beta": losses.kl_beta.item() * batch_size,
+        "loss_kl_var": losses.kl_var.item() * batch_size,
+        "fine_l2_corrected": diagnostics["fine_l2_corrected"].sum().item(),
+        "fine_l2_backbone": diagnostics["fine_l2_backbone"].sum().item(),
+    }
+
+
+def evaluate_model(
+    model,
+    loader,
+    device: torch.device,
+    *,
+    variant: str,
+    mc_samples: int,
+    disable_flux_loss: bool,
+    lambda_backbone: float,
+    lambda_state: float,
+    lambda_pde: float,
+    lambda_flux: float,
+    lambda_reg: float,
+    lambda_mask: float,
+    lambda_nll: float,
+    lambda_kl_beta: float,
+    lambda_kl_var: float,
+):
+    model.eval()
+    totals = {name: 0.0 for name in metric_fieldnames() if name not in {"epoch", "time_sec"}}
+    count = 0
+    last_sample = None
+
+    with torch.no_grad():
+        for coeff, target_coarse, target_fine in loader:
+            coeff = coeff.to(device)
+            target_coarse = target_coarse.to(device)
+            target_fine = target_fine.to(device)
+
+            outputs = model(coeff, mc_samples=mc_samples)
+            losses, diagnostics = compute_losses(
+                outputs,
+                coeff,
+                target_coarse,
+                target_fine,
+                variant=variant,
+                disable_flux_loss=disable_flux_loss,
+                lambda_backbone=lambda_backbone,
+                lambda_state=lambda_state,
+                lambda_pde=lambda_pde,
+                lambda_flux=lambda_flux,
+                lambda_reg=lambda_reg,
+                lambda_mask=lambda_mask,
+                lambda_nll=lambda_nll,
+                lambda_kl_beta=lambda_kl_beta,
+                lambda_kl_var=lambda_kl_var,
+            )
+
+            batch_size = coeff.shape[0]
+            for key, value in aggregate_loss_row(losses, diagnostics, batch_size).items():
+                totals[key] += value
+            count += batch_size
+
+            last_sample = {
+                "coeff": coeff[0].detach().cpu(),
+                "u_backbone": outputs["u_backbone"][0].detach().cpu(),
+                "u_corrected": outputs["pred_mean"][0].detach().cpu(),
+                "target_fine": target_fine[0].detach().cpu(),
+                "b_h": outputs["b_h"][0].detach().cpu(),
+                "pred_std": outputs["pred_std"][0].detach().cpu(),
+            }
+
+    if count == 0:
+        raise RuntimeError("Empty evaluation loader.")
+
+    return {key: value / count for key, value in totals.items()}, last_sample
 
 
 def main() -> None:
@@ -262,7 +317,7 @@ def main() -> None:
         shuffle=False,
     )
 
-    experiment_name = f"{backbone_run_dir.name}_correction"
+    experiment_name = build_experiment_name(args, backbone_run_dir)
     run_dir = ensure_run_dir(REPO_ROOT, experiment_name)
     artifacts = correction_artifact_paths(run_dir)
     config = build_run_config(
@@ -274,7 +329,8 @@ def main() -> None:
         test_path=test_path,
         args=args,
         extra={
-            "model_variant": "darcy_correction",
+            "model_variant": args.variant,
+            "ablation": args.ablation,
             "backbone_run_dir": str(backbone_run_dir),
             "backbone_model_path": str(backbone_model_path),
             "backbone_experiment_name": backbone_run_dir.name,
@@ -287,6 +343,19 @@ def main() -> None:
             "backbone_modes": backbone_modes,
             "backbone_width": backbone_width,
             "correction_train_samples": correction_train_samples,
+            "loss_weights": {
+                "lambda_backbone": args.lambda_backbone,
+                "lambda_state": args.lambda_state,
+                "lambda_pde": args.lambda_pde,
+                "lambda_flux": args.lambda_flux,
+                "lambda_reg": args.lambda_reg,
+                "lambda_mask": args.lambda_mask,
+                "lambda_nll": args.lambda_nll,
+                "lambda_kl_beta": args.lambda_kl_beta,
+                "lambda_kl_var": args.lambda_kl_var,
+            },
+            "mc_samples_train": args.mc_samples_train,
+            "mc_samples_eval": args.mc_samples_eval,
         },
     )
     config["artifacts"].update(
@@ -311,6 +380,10 @@ def main() -> None:
         y_std=y_normalizer.std,
         cg_max_iter=args.cg_max_iter,
         cg_tol=args.cg_tol,
+        variant=args.variant,
+        ablation=args.ablation,
+        disable_interface_correction=args.disable_interface_correction,
+        disable_boundary_correction=args.disable_boundary_correction,
     ).to(device)
     model.backbone.model.load_state_dict(backbone_state_dict)
 
@@ -318,6 +391,7 @@ def main() -> None:
     log_message(f"baseline_run_dir {backbone_run_dir}", artifacts["train_log"], tqdm_module=tqdm)
     log_message(f"baseline_model_path {backbone_model_path}", artifacts["train_log"], tqdm_module=tqdm)
     log_message(
+        f"variant={args.variant} ablation={args.ablation} "
         f"train_subset {correction_train_samples}/{coeff_train_full.shape[0]} "
         f"train_coeff {tuple(coeff_train.shape)} test_coeff {tuple(coeff_test.shape)}",
         artifacts["train_log"],
@@ -348,15 +422,7 @@ def main() -> None:
         for epoch in epoch_iterator:
             t1 = default_timer()
             model.train()
-            running = {
-                "loss_total": 0.0,
-                "loss_backbone_coarse": 0.0,
-                "loss_state_fine": 0.0,
-                "loss_pde": 0.0,
-                "loss_flux": 0.0,
-                "loss_reg": 0.0,
-                "loss_mask": 0.0,
-            }
+            running = {name: 0.0 for name in metric_fieldnames() if name not in {"epoch", "time_sec"}}
             train_count = 0
 
             batch_iterator = train_loader
@@ -376,30 +442,30 @@ def main() -> None:
                 target_fine = target_fine.to(device)
 
                 optimizer.zero_grad()
-                outputs = model(coeff)
+                outputs = model(coeff, mc_samples=args.mc_samples_train if args.variant == "bayesian" else 1)
                 losses, diagnostics = compute_losses(
                     outputs,
                     coeff,
                     target_coarse,
                     target_fine,
+                    variant=args.variant,
+                    disable_flux_loss=args.disable_flux_loss,
                     lambda_backbone=args.lambda_backbone,
                     lambda_state=args.lambda_state,
                     lambda_pde=args.lambda_pde,
                     lambda_flux=args.lambda_flux,
                     lambda_reg=args.lambda_reg,
                     lambda_mask=args.lambda_mask,
+                    lambda_nll=args.lambda_nll,
+                    lambda_kl_beta=args.lambda_kl_beta,
+                    lambda_kl_var=args.lambda_kl_var,
                 )
                 losses.total.backward()
                 optimizer.step()
 
                 batch_size = coeff.shape[0]
-                running["loss_total"] += losses.total.item() * batch_size
-                running["loss_backbone_coarse"] += losses.backbone_coarse.item() * batch_size
-                running["loss_state_fine"] += losses.state_fine.item() * batch_size
-                running["loss_pde"] += losses.pde.item() * batch_size
-                running["loss_flux"] += losses.flux.item() * batch_size
-                running["loss_reg"] += losses.reg.item() * batch_size
-                running["loss_mask"] += losses.mask.item() * batch_size
+                for key, value in aggregate_loss_row(losses, diagnostics, batch_size).items():
+                    running[key] += value
                 train_count += batch_size
 
                 if tqdm is not None:
@@ -413,12 +479,18 @@ def main() -> None:
                 model,
                 test_loader,
                 device,
+                variant=args.variant,
+                mc_samples=args.mc_samples_eval if args.variant == "bayesian" else 1,
+                disable_flux_loss=args.disable_flux_loss,
                 lambda_backbone=args.lambda_backbone,
                 lambda_state=args.lambda_state,
                 lambda_pde=args.lambda_pde,
                 lambda_flux=args.lambda_flux,
                 lambda_reg=args.lambda_reg,
                 lambda_mask=args.lambda_mask,
+                lambda_nll=args.lambda_nll,
+                lambda_kl_beta=args.lambda_kl_beta,
+                lambda_kl_var=args.lambda_kl_var,
             )
 
             row = {
@@ -431,10 +503,13 @@ def main() -> None:
                 "loss_flux": running["loss_flux"] / train_count,
                 "loss_reg": running["loss_reg"] / train_count,
                 "loss_mask": running["loss_mask"] / train_count,
+                "loss_nll": running["loss_nll"] / train_count,
+                "loss_kl_beta": running["loss_kl_beta"] / train_count,
+                "loss_kl_var": running["loss_kl_var"] / train_count,
                 "fine_l2_corrected": eval_metrics["fine_l2_corrected"],
                 "fine_l2_backbone": eval_metrics["fine_l2_backbone"],
             }
-            append_csv_row(csv_path, stage_fieldnames(), row)
+            append_csv_row(csv_path, metric_fieldnames(), row)
             summary = (
                 f"{stage_name} epoch={epoch:04d} time={t2 - t1:.4f} "
                 f"loss_total={row['loss_total']:.6e} "
@@ -442,6 +517,9 @@ def main() -> None:
                 f"loss_state={row['loss_state_fine']:.6e} "
                 f"loss_pde={row['loss_pde']:.6e} "
                 f"loss_flux={row['loss_flux']:.6e} "
+                f"loss_nll={row['loss_nll']:.6e} "
+                f"loss_kl_beta={row['loss_kl_beta']:.6e} "
+                f"loss_kl_var={row['loss_kl_var']:.6e} "
                 f"fine_l2_corrected={row['fine_l2_corrected']:.6e} "
                 f"fine_l2_backbone={row['fine_l2_backbone']:.6e}"
             )
@@ -454,7 +532,13 @@ def main() -> None:
                     fine_backbone=f"{row['fine_l2_backbone']:.3e}",
                 )
 
-    run_stage("Stage2", args.stage2_epochs, args.stage2_learning_rate, False, artifacts["stage2_metrics"])
+    run_stage(
+        "Stage2",
+        args.stage2_epochs,
+        args.stage2_learning_rate,
+        not args.freeze_backbone_stage2,
+        artifacts["stage2_metrics"],
+    )
     run_stage("Stage3", args.stage3_epochs, args.stage3_learning_rate, True, artifacts["stage3_metrics"])
 
     torch.save(model, artifacts["model"])
@@ -467,6 +551,7 @@ def main() -> None:
     )
 
     if args.save_sample_plot and last_sample is not None:
+        plot_std = last_sample["pred_std"] if args.variant == "bayesian" else None
         save_sample_plot(
             artifacts["sample"],
             last_sample["coeff"],
@@ -474,6 +559,7 @@ def main() -> None:
             last_sample["u_corrected"],
             last_sample["target_fine"],
             last_sample["b_h"],
+            pred_std=plot_std,
         )
         log_message(f"Saved sample plot -> {artifacts['sample']}", artifacts["train_log"], tqdm_module=tqdm)
 
@@ -486,6 +572,8 @@ def main() -> None:
             "correction_train_samples": np.asarray([correction_train_samples], dtype=np.int64),
             "stage2_epochs": np.asarray([args.stage2_epochs], dtype=np.int64),
             "stage3_epochs": np.asarray([args.stage3_epochs], dtype=np.int64),
+            "variant": np.asarray([args.variant], dtype=object),
+            "ablation": np.asarray([args.ablation], dtype=object),
         },
     )
     log_message(f"Saved train summary -> {artifacts['train_summary']}", artifacts["train_log"], tqdm_module=tqdm)
