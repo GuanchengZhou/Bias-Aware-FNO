@@ -12,6 +12,7 @@ model/
 results/
 pred/
 image/
+runs/
 
 output/jupyter-notebook/stokes-random-mesh-error-256/
 output/jupyter-notebook/ns-5holes-fenicsx-dataset-visualization/

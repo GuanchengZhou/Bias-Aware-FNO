@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
+import sys
 from pathlib import Path
 from timeit import default_timer
 
@@ -19,6 +21,14 @@ except ImportError:  # pragma: no cover - optional dependency
     tqdm = None
 
 from Adam import Adam
+from run_artifacts import (
+    append_csv_row,
+    build_run_config,
+    ensure_run_dir,
+    log_message,
+    standard_artifact_paths,
+    write_json,
+)
 from utilities3 import LpLoss, MatReader, UnitGaussianNormalizer, count_params
 
 
@@ -149,11 +159,6 @@ def format_experiment_name(train_path: Path, ntrain: int, epochs: int, modes: in
     return f"{train_path.stem}_fourier_2d_darcy_N{ntrain}_ep{epochs}_m{modes}_w{width}"
 
 
-def ensure_output_dirs() -> None:
-    for name in ["model", "results", "pred", "image"]:
-        (REPO_ROOT / name).mkdir(parents=True, exist_ok=True)
-
-
 def save_sample_plot(path: Path, coeff: torch.Tensor, pred: torch.Tensor, coarse: torch.Tensor, fine: torch.Tensor) -> None:
     fig, axes = plt.subplots(1, 5, figsize=(20, 4))
     panels = [
@@ -202,7 +207,6 @@ def main() -> None:
     args = parse_args()
     torch.manual_seed(int(args.seed))
     np.random.seed(int(args.seed))
-    ensure_output_dirs()
 
     train_path = args.train_path or default_dataset_path(
         "train",
@@ -247,11 +251,40 @@ def main() -> None:
         shuffle=False,
     )
 
+    experiment_name = format_experiment_name(
+        train_path=train_path,
+        ntrain=args.ntrain,
+        epochs=args.epochs,
+        modes=args.modes,
+        width=args.width,
+    )
+    run_dir = ensure_run_dir(REPO_ROOT, experiment_name)
+    artifacts = standard_artifact_paths(run_dir)
+    config = build_run_config(
+        task="darcy_fem",
+        script_name=Path(__file__).name,
+        experiment_name=run_dir.name,
+        run_dir=run_dir,
+        train_path=train_path,
+        test_path=test_path,
+        args=args,
+    )
+    write_json(artifacts["config"], config)
+
     device = resolve_device(args.device)
     model = FNO2d(args.modes, args.modes, args.width).to(device)
-    print("train_x", tuple(x_train.shape), "train_y", tuple(y_train_coarse.shape))
-    print("test_x", tuple(x_test.shape), "test_y", tuple(y_test_fine.shape))
-    print("params", count_params(model))
+    log_message(f"run_dir {run_dir}", artifacts["train_log"], tqdm_module=tqdm)
+    log_message(
+        f"train_x {tuple(x_train.shape)} train_y {tuple(y_train_coarse.shape)}",
+        artifacts["train_log"],
+        tqdm_module=tqdm,
+    )
+    log_message(
+        f"test_x {tuple(x_test.shape)} test_y {tuple(y_test_fine.shape)}",
+        artifacts["train_log"],
+        tqdm_module=tqdm,
+    )
+    log_message(f"params {count_params(model)}", artifacts["train_log"], tqdm_module=tqdm)
 
     optimizer = Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.StepLR(
@@ -262,18 +295,6 @@ def main() -> None:
     loss_fn = LpLoss(size_average=False)
     if device.type == "cuda":
         y_normalizer.cuda()
-
-    experiment_name = format_experiment_name(
-        train_path=train_path,
-        ntrain=args.ntrain,
-        epochs=args.epochs,
-        modes=args.modes,
-        width=args.width,
-    )
-    path_model = REPO_ROOT / "model" / experiment_name
-    path_train_err = REPO_ROOT / "results" / f"{experiment_name}_train.txt"
-    path_test_err = REPO_ROOT / "results" / f"{experiment_name}_test.txt"
-    path_image = REPO_ROOT / "image" / f"{experiment_name}_sample.png"
 
     last_sample = None
     last_test_coarse_reference = float("nan")
@@ -329,8 +350,16 @@ def main() -> None:
         should_test = ((ep + 1) % args.test_every == 0) or (ep == args.epochs - 1)
 
         train_summary = f"{ep:04d} {t2 - t1:.4f} {train_metric:.6e}"
-        with path_train_err.open("a", encoding="utf-8") as handle:
-            handle.write(train_summary + "\n")
+        append_csv_row(
+            artifacts["train_metrics"],
+            ["epoch", "time_sec", "train_l2_coarse"],
+            {
+                "epoch": ep,
+                "time_sec": t2 - t1,
+                "train_l2_coarse": train_metric,
+            },
+        )
+        log_message(train_summary, artifacts["train_log"], tqdm_module=tqdm)
 
         if should_test:
             model.eval()
@@ -388,27 +417,41 @@ def main() -> None:
                 tqdm.write(test_summary)
             else:
                 print(test_summary)
-            with path_test_err.open("a", encoding="utf-8") as handle:
+            with artifacts["train_log"].open("a", encoding="utf-8") as handle:
                 handle.write(test_summary + "\n")
+            append_csv_row(
+                artifacts["test_metrics"],
+                ["epoch", "time_sec", "train_l2_coarse", "test_l2_coarse_reference", "test_l2_fine"],
+                {
+                    "epoch": ep,
+                    "time_sec": t2 - t1,
+                    "train_l2_coarse": train_metric,
+                    "test_l2_coarse_reference": last_test_coarse_reference,
+                    "test_l2_fine": last_test_fine,
+                },
+            )
 
         if tqdm is not None:
             epoch_iterator.set_postfix(
                 train_l2_coarse=f"{train_metric:.3e}",
                 test_l2_fine=f"{last_test_fine:.3e}" if np.isfinite(last_test_fine) else "pending",
             )
-        elif not should_test:
-            print(train_summary)
-
-    torch.save(model, path_model)
-    print(f"Saved model -> {path_model}")
+    torch.save(model, artifacts["model"])
+    torch.save(model.state_dict(), artifacts["model_state_dict"])
+    log_message(f"Saved model -> {artifacts['model']}", artifacts["train_log"], tqdm_module=tqdm)
+    log_message(
+        f"Saved model_state_dict -> {artifacts['model_state_dict']}",
+        artifacts["train_log"],
+        tqdm_module=tqdm,
+    )
 
     if args.save_sample_plot and last_sample is not None:
         coeff_plot, pred_plot, coarse_plot, fine_plot = last_sample
-        save_sample_plot(path_image, coeff_plot, pred_plot, coarse_plot, fine_plot)
-        print(f"Saved sample plot -> {path_image}")
+        save_sample_plot(artifacts["sample"], coeff_plot, pred_plot, coarse_plot, fine_plot)
+        log_message(f"Saved sample plot -> {artifacts['sample']}", artifacts["train_log"], tqdm_module=tqdm)
 
     scipy.io.savemat(
-        REPO_ROOT / "pred" / f"{experiment_name}_train_summary.mat",
+        artifacts["train_summary"],
         {
             "train_x_shape": np.asarray(x_train.shape, dtype=np.int64),
             "train_y_shape": np.asarray(y_train_coarse.shape, dtype=np.int64),
@@ -417,6 +460,25 @@ def main() -> None:
             "coeff_resolution": np.asarray([args.coeff_resolution], dtype=np.int64),
         },
     )
+    log_message(f"Saved train summary -> {artifacts['train_summary']}", artifacts["train_log"], tqdm_module=tqdm)
+
+    eval_command = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "eval_2d_darcy_fem.py"),
+        "--run-dir",
+        str(run_dir),
+        "--device",
+        args.device,
+        "--batch-size",
+        str(args.batch_size),
+    ]
+    log_message(
+        f"Running evaluation -> {' '.join(eval_command)}",
+        artifacts["train_log"],
+        tqdm_module=tqdm,
+    )
+    subprocess.run(eval_command, check=True, cwd=REPO_ROOT)
+    log_message("Evaluation completed.", artifacts["train_log"], tqdm_module=tqdm)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
+import sys
 from pathlib import Path
 from timeit import default_timer
 
@@ -14,10 +17,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from Adam import Adam
+from run_artifacts import (
+    append_csv_row,
+    build_run_config,
+    ensure_run_dir,
+    log_message,
+    standard_artifact_paths,
+    write_json,
+)
 from utilities3 import LpLoss, MatReader, count_params
 
 
 REPO_ROOT = Path(__file__).resolve().parent
+MPLCONFIGDIR = REPO_ROOT / "tmp" / "matplotlib"
+MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(MPLCONFIGDIR))
 
 
 def format_float_token(value: float) -> str:
@@ -195,11 +209,6 @@ def load_dataset(path: Path, count: int, sub: int, t_in: int, t_out: int):
     return x, y, mask
 
 
-def ensure_output_dirs():
-    for name in ["model", "results", "pred", "image"]:
-        (REPO_ROOT / name).mkdir(parents=True, exist_ok=True)
-
-
 def save_sample_plot(path: Path, pred: torch.Tensor, truth: torch.Tensor) -> None:
     import matplotlib.pyplot as plt
 
@@ -227,16 +236,12 @@ def main() -> None:
     if not test_path.exists():
         raise FileNotFoundError(f"Test dataset not found: {test_path}")
 
-    ensure_output_dirs()
     device = resolve_device(args.device)
 
     train_x, train_y, _ = load_dataset(train_path, args.ntrain, args.sub, args.T_in, args.T)
     test_x, test_y, _ = load_dataset(test_path, args.ntest, args.sub, args.T_in, args.T)
 
     size = train_x.shape[1]
-    print("train_x", tuple(train_x.shape), "train_y", tuple(train_y.shape))
-    print("test_x", tuple(test_x.shape), "test_y", tuple(test_y.shape))
-
     train_loader = torch.utils.data.DataLoader(
         torch.utils.data.TensorDataset(train_x, train_y), batch_size=args.batch_size, shuffle=True
     )
@@ -254,10 +259,23 @@ def main() -> None:
     loss_fn = LpLoss(size_average=False)
 
     experiment_name = format_experiment_name(train_path, args.ntrain, args.epochs, args.modes, args.width, args.T_in, args.T)
-    path_model = REPO_ROOT / "model" / experiment_name
-    path_train_err = REPO_ROOT / "results" / f"{experiment_name}_train.txt"
-    path_test_err = REPO_ROOT / "results" / f"{experiment_name}_test.txt"
-    path_image = REPO_ROOT / "image" / f"{experiment_name}_sample.png"
+    run_dir = ensure_run_dir(REPO_ROOT, experiment_name)
+    artifacts = standard_artifact_paths(run_dir)
+    config = build_run_config(
+        task="ns_5holes",
+        script_name=Path(__file__).name,
+        experiment_name=run_dir.name,
+        run_dir=run_dir,
+        train_path=train_path,
+        test_path=test_path,
+        args=args,
+        extra={"spatial_size": int(size)},
+    )
+    write_json(artifacts["config"], config)
+    log_message(f"run_dir {run_dir}", artifacts["train_log"])
+    log_message(f"train_x {tuple(train_x.shape)} train_y {tuple(train_y.shape)}", artifacts["train_log"])
+    log_message(f"test_x {tuple(test_x.shape)} test_y {tuple(test_y.shape)}", artifacts["train_log"])
+    log_message(f"params {count_params(model)}", artifacts["train_log"])
 
     last_test_pred = None
     last_test_truth = None
@@ -307,21 +325,41 @@ def main() -> None:
             f"{train_l2_step / train_count:.6e} {train_l2_full / train_count:.6e} "
             f"{test_l2_step / test_count:.6e} {test_l2_full / test_count:.6e}"
         )
-        print(summary)
-        with path_train_err.open("a", encoding="utf-8") as f:
-            f.write(summary + "\n")
-        with path_test_err.open("a", encoding="utf-8") as f:
-            f.write(summary + "\n")
+        log_message(summary, artifacts["train_log"])
+        append_csv_row(
+            artifacts["train_metrics"],
+            ["epoch", "time_sec", "train_l2_step", "train_l2_full"],
+            {
+                "epoch": ep,
+                "time_sec": t2 - t1,
+                "train_l2_step": train_l2_step / train_count,
+                "train_l2_full": train_l2_full / train_count,
+            },
+        )
+        append_csv_row(
+            artifacts["test_metrics"],
+            ["epoch", "time_sec", "train_l2_step", "train_l2_full", "test_l2_step", "test_l2_full"],
+            {
+                "epoch": ep,
+                "time_sec": t2 - t1,
+                "train_l2_step": train_l2_step / train_count,
+                "train_l2_full": train_l2_full / train_count,
+                "test_l2_step": test_l2_step / test_count,
+                "test_l2_full": test_l2_full / test_count,
+            },
+        )
 
-    torch.save(model, path_model)
-    print(f"Saved model -> {path_model}")
+    torch.save(model, artifacts["model"])
+    torch.save(model.state_dict(), artifacts["model_state_dict"])
+    log_message(f"Saved model -> {artifacts['model']}", artifacts["train_log"])
+    log_message(f"Saved model_state_dict -> {artifacts['model_state_dict']}", artifacts["train_log"])
 
     if args.save_sample_plot and last_test_pred is not None and last_test_truth is not None:
-        save_sample_plot(path_image, last_test_pred[0, :, :, -1], last_test_truth[0, :, :, -1])
-        print(f"Saved sample plot -> {path_image}")
+        save_sample_plot(artifacts["sample"], last_test_pred[0, :, :, -1], last_test_truth[0, :, :, -1])
+        log_message(f"Saved sample plot -> {artifacts['sample']}", artifacts["train_log"])
 
     scipy.io.savemat(
-        REPO_ROOT / "pred" / f"{experiment_name}_train_summary.mat",
+        artifacts["train_summary"],
         {
             "train_x_shape": np.asarray(train_x.shape, dtype=np.int64),
             "train_y_shape": np.asarray(train_y.shape, dtype=np.int64),
@@ -330,6 +368,19 @@ def main() -> None:
             "spatial_size": np.asarray([size], dtype=np.int64),
         },
     )
+    log_message(f"Saved train summary -> {artifacts['train_summary']}", artifacts["train_log"])
+
+    eval_command = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "eval_2d_time_5holes.py"),
+        "--run-dir",
+        str(run_dir),
+        "--device",
+        args.device,
+    ]
+    log_message(f"Running evaluation -> {' '.join(eval_command)}", artifacts["train_log"])
+    subprocess.run(eval_command, check=True, cwd=REPO_ROOT)
+    log_message("Evaluation completed.", artifacts["train_log"])
 
 
 if __name__ == "__main__":

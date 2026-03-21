@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "data")
     parser.add_argument("--n-train", type=int, default=1000)
     parser.add_argument("--n-test", type=int, default=100)
-    parser.add_argument("--coeff-resolution", type=int, default=421)
+    parser.add_argument("--coeff-resolution", type=int, default=256)
     parser.add_argument("--coarse-n", type=int, default=256)
     parser.add_argument("--fine-n", type=int, default=512)
     parser.add_argument("--grf-alpha", type=float, default=2.0)

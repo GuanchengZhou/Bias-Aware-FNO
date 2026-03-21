@@ -7,6 +7,24 @@ The repo now also includes an FNO-style Darcy Flow pipeline with paired coarse/f
 Data generation now uses `gmsh + dolfinx + PETSc` in `fenicsx-env`.
 Training and evaluation still use the original FNO-style PyTorch scripts in `torch_310`.
 
+Each training run now writes a self-contained result bundle to:
+```bash
+runs/<experiment_name>/
+```
+
+Typical contents include:
+- `config.json`
+- `model.pt`
+- `model_state_dict.pt`
+- `train.log`
+- `train_metrics.csv`
+- `test_metrics.csv`
+- `eval.log`
+- `eval_metrics.json`
+- `predictions.mat`
+- `sample.png`
+- `train_summary.mat`
+
 PyTorch environment:
 ```bash
 /Users/zhougc/miniconda3/envs/torch_310/bin/python
@@ -137,10 +155,17 @@ Darcy training uses:
 - `y_test = sol_fine`
 
 There is no `sub` downsampling in the Darcy pipeline anymore.
+After training finishes, the script automatically runs evaluation and stores everything in the new run directory.
 
 ## Evaluation
 ```bash
 /Users/zhougc/miniconda3/envs/torch_310/bin/python scripts/eval_2d_time_5holes.py
+```
+
+Run-directory evaluation:
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python scripts/eval_2d_time_5holes.py \
+  --run-dir runs/<experiment_name>
 ```
 
 Smoke test:
@@ -160,6 +185,12 @@ Smoke test:
 Darcy evaluation:
 ```bash
 /Users/zhougc/miniconda3/envs/torch_310/bin/python scripts/eval_2d_darcy_fem.py
+```
+
+Run-directory evaluation:
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python scripts/eval_2d_darcy_fem.py \
+  --run-dir runs/<experiment_name>
 ```
 
 Darcy smoke test:
@@ -193,4 +224,11 @@ Darcy notebook path:
 /Users/zhougc/Desktop/IID/LRTOR_project/Bias_Aware_FNO/output/jupyter-notebook/darcy-fem-coarse-fine-visualization.ipynb
 ```
 
-The Darcy notebook reads paired train/test `.mat` files, shows coarse/fine mesh metadata, visualizes `coeff`, `sol_coarse`, `sol_fine`, `error_hf_lf`, and optionally compares saved predictions in `pred/`.
+The Darcy notebook reads paired train/test `.mat` files, shows coarse/fine mesh metadata, visualizes `coeff`, `sol_coarse`, `sol_fine`, `error_hf_lf`, and can also compare saved predictions from a run directory.
+
+The new default workflow is:
+1. Generate data into `data/`
+2. Train once
+3. Inspect artifacts inside `runs/<experiment_name>/`
+
+For new experiments, `runs/<experiment_name>/predictions.mat` and `runs/<experiment_name>/eval_metrics.json` are the primary test outputs.
