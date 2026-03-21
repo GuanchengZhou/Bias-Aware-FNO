@@ -185,7 +185,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-path", type=Path, default=None)
     parser.add_argument("--ntrain", type=int, default=1000)
     parser.add_argument("--ntest", type=int, default=100)
-    parser.add_argument("--coeff-resolution", type=int, default=421)
+    parser.add_argument("--coeff-resolution", type=int, default=256)
     parser.add_argument("--coarse-n", type=int, default=256)
     parser.add_argument("--fine-n", type=int, default=512)
     parser.add_argument("--modes", type=int, default=12)
