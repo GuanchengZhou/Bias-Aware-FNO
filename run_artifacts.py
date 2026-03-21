@@ -44,6 +44,18 @@ def standard_artifact_paths(run_dir: Path) -> dict[str, Path]:
     }
 
 
+def correction_artifact_paths(run_dir: Path) -> dict[str, Path]:
+    paths = standard_artifact_paths(run_dir)
+    paths.update(
+        {
+            "stage2_metrics": run_dir / "stage2_metrics.csv",
+            "stage3_metrics": run_dir / "stage3_metrics.csv",
+            "correction_diagnostics": run_dir / "correction_diagnostics.mat",
+        }
+    )
+    return paths
+
+
 def _jsonify(value):
     if isinstance(value, Path):
         return str(value)

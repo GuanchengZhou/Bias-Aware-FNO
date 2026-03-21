@@ -44,6 +44,9 @@ FEniCSx environment:
 - `data_generation/darcy/darcy_fem_fenicsx.py`: paired coarse/fine Darcy FEM generator.
 - `fourier_2d_darcy_fem.py`: static FNO-Darcy training script with coarse supervision and fine testing.
 - `scripts/eval_2d_darcy_fem.py`: Darcy evaluation against coarse and fine targets on the shared grid.
+- `darcy_correction.py`: structured flux correction model on the shared Darcy grid.
+- `fourier_2d_darcy_correction.py`: Stage 2 / Stage 3 correction training on top of a Stage 1 run.
+- `scripts/eval_2d_darcy_correction.py`: correction-run evaluation with backbone vs corrected diagnostics.
 
 ## Data Generation
 ```bash
@@ -157,6 +160,29 @@ Darcy training uses:
 There is no `sub` downsampling in the Darcy pipeline anymore.
 After training finishes, the script automatically runs evaluation and stores everything in the new run directory.
 
+Darcy correction training:
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python fourier_2d_darcy_correction.py \
+  --backbone-run-dir runs/<stage1_experiment_name>
+```
+
+Darcy correction smoke test:
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python fourier_2d_darcy_correction.py \
+  --backbone-run-dir runs/darcy_fem_r129_C32_F64_N4_train_fourier_2d_darcy_N4_ep1_m12_w32 \
+  --stage2-epochs 1 \
+  --stage3-epochs 1 \
+  --batch-size 1 \
+  --device cpu \
+  --save-sample-plot
+```
+
+Darcy correction uses:
+- Stage 1 baseline backbone from an existing run directory
+- Stage 2 and Stage 3 only on the first `100` training samples, or all samples if fewer than `100`
+- coarse supervision for the backbone term
+- fine supervision for the corrected output
+
 ## Evaluation
 ```bash
 /Users/zhougc/miniconda3/envs/torch_310/bin/python scripts/eval_2d_time_5holes.py
@@ -206,6 +232,12 @@ Darcy smoke test:
   --device cpu
 ```
 
+Darcy correction evaluation:
+```bash
+/Users/zhougc/miniconda3/envs/torch_310/bin/python scripts/eval_2d_darcy_correction.py \
+  --run-dir runs/<stage1_experiment_name>_correction
+```
+
 ## Visualization Notebook
 Notebook path:
 ```bash
@@ -225,6 +257,21 @@ Darcy notebook path:
 ```
 
 The Darcy notebook reads paired train/test `.mat` files, shows coarse/fine mesh metadata, visualizes `coeff`, `sol_coarse`, `sol_fine`, `error_hf_lf`, and can also compare saved predictions from a run directory.
+
+Darcy correction notebook path:
+```bash
+/Users/zhougc/Desktop/IID/LRTOR_project/Bias_Aware_FNO/output/jupyter-notebook/darcy-fno-correction-visualization.ipynb
+```
+
+The correction notebook reads a correction run directory and visualizes:
+- `pred_backbone`
+- `pred_corrected`
+- `target_fine`
+- `b_h`
+- `|tau_x| + |tau_y|`
+- `residual_corrected`
+- `flux_error_corrected`
+- sample-level backbone vs corrected improvement statistics
 
 The new default workflow is:
 1. Generate data into `data/`
